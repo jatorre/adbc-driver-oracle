@@ -106,6 +106,10 @@ go test -v ./go/
 go build -o oracle-adbc-test ./cmd/
 ```
 
+## Credits
+
+Developed by [CARTO](https://carto.com/).
+
 ## License
 
-Apache License 2.0
+Copyright 2025 CARTO. Licensed under the Apache License 2.0.

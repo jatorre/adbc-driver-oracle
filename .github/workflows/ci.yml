@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Unit tests
+        run: go test -v ./go/...
+
+      - name: Build driver package
+        run: go build ./go/
+
+      - name: Build CLI
+        run: go build -o oracle-adbc-test ./cmd/main.go
+
+      - name: Vet
+        run: go vet ./go/...
+
+  build-shared-library:
+    name: Build shared library
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: libadbc_driver_oracle.so
+          - os: macos-latest
+            artifact: libadbc_driver_oracle.dylib
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build shared library
+        run: |
+          CGO_ENABLED=1 go build -tags driverlib -buildmode=c-shared \
+            -o ${{ matrix.artifact }} ./pkg/oracle/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  integration-test:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Integration tests
+        if: env.ORACLE_TEST_DSN != ''
+        env:
+          ORACLE_TEST_DSN: ${{ secrets.ORACLE_TEST_DSN }}
+        run: go test -v -run TestIntegration ./go/...

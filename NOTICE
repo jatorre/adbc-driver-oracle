@@ -1,0 +1,7 @@
+adbc-driver-oracle
+Copyright 2025 CARTO
+
+This product includes software developed at CARTO (https://carto.com/).
+
+This product includes software from the Apache Arrow ADBC project
+(https://arrow.apache.org/adbc/), licensed under the Apache License 2.0.
