@@ -1,0 +1,6 @@
+*.dylib
+*.so
+*.dll
+*.h
+*.exe
+/build/
