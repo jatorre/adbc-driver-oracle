@@ -202,15 +202,31 @@ func (s *statementImpl) extractBindArgs(rowIdx int) []interface{} {
 // extractArrowValue reads a single value from an Arrow array at the given index.
 func extractArrowValue(arr arrow.Array, idx int) interface{} {
 	switch a := arr.(type) {
+	case *array.Int8:
+		return int64(a.Value(idx))
+	case *array.Int16:
+		return int64(a.Value(idx))
+	case *array.Int32:
+		return int64(a.Value(idx))
 	case *array.Int64:
 		return a.Value(idx)
-	case *array.Int32:
-		return a.Value(idx)
+	case *array.Uint8:
+		return int64(a.Value(idx))
+	case *array.Uint16:
+		return int64(a.Value(idx))
+	case *array.Uint32:
+		return int64(a.Value(idx))
+	case *array.Uint64:
+		return int64(a.Value(idx))
+	case *array.Float32:
+		return float64(a.Value(idx))
 	case *array.Float64:
 		return a.Value(idx)
-	case *array.Float32:
-		return a.Value(idx)
+	case *array.Decimal128:
+		return a.Value(idx).ToString(a.DataType().(*arrow.Decimal128Type).Scale)
 	case *array.String:
+		return a.Value(idx)
+	case *array.LargeString:
 		return a.Value(idx)
 	case *array.Binary:
 		return a.Value(idx)
@@ -218,8 +234,11 @@ func extractArrowValue(arr arrow.Array, idx int) interface{} {
 		return a.Value(idx)
 	case *array.Timestamp:
 		return a.Value(idx).ToTime(arrow.Microsecond)
+	case *array.Date32:
+		return a.Value(idx).ToTime()
 	default:
-		return fmt.Sprintf("%v", a)
+		// Fallback: use the string representation
+		return arr.ValueStr(idx)
 	}
 }
 
@@ -294,34 +313,103 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 }
 
 func (s *statementImpl) insertBatch(ctx context.Context, stmt *sql.Stmt, rec arrow.RecordBatch) (int64, error) {
-	numRows := rec.NumRows()
+	numRows := int(rec.NumRows())
 	numCols := int(rec.NumCols())
-	var inserted int64
 
-	for row := 0; row < int(numRows); row++ {
-		args := make([]interface{}, numCols)
-		for col := 0; col < numCols; col++ {
-			arr := rec.Column(col)
-			if arr.IsNull(row) {
-				args[col] = nil
+	// Build columnar arrays for go-ora batch insert.
+	// go-ora's batch mode: pass slices as args, one slice per column.
+	args := make([]interface{}, numCols)
+	for col := 0; col < numCols; col++ {
+		arr := rec.Column(col)
+		args[col] = arrowColumnToSlice(arr, numRows)
+	}
+
+	_, err := stmt.ExecContext(ctx, args...)
+	if err != nil {
+		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "batch insert failed: %s", err)
+	}
+
+	if _, err := s.cnxn.db.ExecContext(ctx, "COMMIT"); err != nil {
+		return int64(numRows), s.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
+	}
+
+	return int64(numRows), nil
+}
+
+// arrowColumnToSlice converts an Arrow array to a Go slice for go-ora batch insert.
+func arrowColumnToSlice(arr arrow.Array, numRows int) interface{} {
+	switch a := arr.(type) {
+	case *array.Int64:
+		vals := make([]sql.NullInt64, numRows)
+		for i := 0; i < numRows; i++ {
+			if a.IsNull(i) {
+				vals[i] = sql.NullInt64{}
 			} else {
-				args[col] = extractArrowValue(arr, row)
+				vals[i] = sql.NullInt64{Int64: a.Value(i), Valid: true}
 			}
 		}
-
-		_, err := stmt.ExecContext(ctx, args...)
-		if err != nil {
-			return inserted, s.ErrorHelper.Errorf(adbc.StatusIO, "insert row %d failed: %s", row, err)
+		return vals
+	case *array.Int32:
+		vals := make([]sql.NullInt64, numRows)
+		for i := 0; i < numRows; i++ {
+			if a.IsNull(i) {
+				vals[i] = sql.NullInt64{}
+			} else {
+				vals[i] = sql.NullInt64{Int64: int64(a.Value(i)), Valid: true}
+			}
 		}
-		inserted++
+		return vals
+	case *array.Float64:
+		vals := make([]sql.NullFloat64, numRows)
+		for i := 0; i < numRows; i++ {
+			if a.IsNull(i) {
+				vals[i] = sql.NullFloat64{}
+			} else {
+				vals[i] = sql.NullFloat64{Float64: a.Value(i), Valid: true}
+			}
+		}
+		return vals
+	case *array.String:
+		vals := make([]sql.NullString, numRows)
+		for i := 0; i < numRows; i++ {
+			if a.IsNull(i) {
+				vals[i] = sql.NullString{}
+			} else {
+				vals[i] = sql.NullString{String: a.Value(i), Valid: true}
+			}
+		}
+		return vals
+	case *array.Binary:
+		vals := make([][]byte, numRows)
+		for i := 0; i < numRows; i++ {
+			if !a.IsNull(i) {
+				vals[i] = a.Value(i)
+			}
+		}
+		return vals
+	case *array.Decimal128:
+		vals := make([]sql.NullString, numRows)
+		scale := a.DataType().(*arrow.Decimal128Type).Scale
+		for i := 0; i < numRows; i++ {
+			if a.IsNull(i) {
+				vals[i] = sql.NullString{}
+			} else {
+				vals[i] = sql.NullString{String: a.Value(i).ToString(scale), Valid: true}
+			}
+		}
+		return vals
+	default:
+		// Fallback: convert to string slice
+		vals := make([]sql.NullString, numRows)
+		for i := 0; i < numRows; i++ {
+			if arr.IsNull(i) {
+				vals[i] = sql.NullString{}
+			} else {
+				vals[i] = sql.NullString{String: arr.ValueStr(i), Valid: true}
+			}
+		}
+		return vals
 	}
-
-	// Commit after each batch
-	if _, err := s.cnxn.db.ExecContext(ctx, "COMMIT"); err != nil {
-		return inserted, s.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
-	}
-
-	return inserted, nil
 }
 
 func (s *statementImpl) prepareIngestTable(ctx context.Context, tableName string, schema *arrow.Schema, mode string) error {
@@ -368,10 +456,17 @@ func arrowToOracleType(dt arrow.DataType) string {
 	switch dt.ID() {
 	case arrow.INT8, arrow.INT16, arrow.INT32, arrow.INT64:
 		return "NUMBER(19)"
+	case arrow.UINT8, arrow.UINT16, arrow.UINT32, arrow.UINT64:
+		return "NUMBER(19)"
 	case arrow.FLOAT16, arrow.FLOAT32:
 		return "BINARY_FLOAT"
 	case arrow.FLOAT64:
 		return "BINARY_DOUBLE"
+	case arrow.DECIMAL128, arrow.DECIMAL256:
+		if dec, ok := dt.(*arrow.Decimal128Type); ok {
+			return fmt.Sprintf("NUMBER(%d,%d)", dec.Precision, dec.Scale)
+		}
+		return "NUMBER"
 	case arrow.STRING, arrow.LARGE_STRING:
 		return "VARCHAR2(4000)"
 	case arrow.BINARY, arrow.LARGE_BINARY:
