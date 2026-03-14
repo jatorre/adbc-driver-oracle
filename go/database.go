@@ -129,7 +129,11 @@ func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		db:                 sqlDB,
 	}
 
-	return driverbase.NewConnectionBuilder(cnxn).Connection(), nil
+	return driverbase.NewConnectionBuilder(cnxn).
+		WithDbObjectsEnumerator(cnxn).
+		WithTableTypeLister(cnxn).
+		WithCurrentNamespacer(cnxn).
+		Connection(), nil
 }
 
 func (db *databaseImpl) Close() error {

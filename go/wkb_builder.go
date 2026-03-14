@@ -491,7 +491,7 @@ func densifyArcRing(ordinates []float64, dims int) []float64 {
 
 	// Process arcs: each arc is 3 consecutive points (start, mid, end).
 	// Arcs share endpoints, so we step by 2 points per arc.
-	for i := 0; i+2*dims <= len(ordinates); i += 2 * dims {
+	for i := 0; i+2*dims+1 < len(ordinates); i += 2 * dims {
 		x1, y1 := ordinates[i], ordinates[i+1]
 		xm, ym := ordinates[i+dims], ordinates[i+dims+1]
 		x2, y2 := ordinates[i+2*dims], ordinates[i+2*dims+1]

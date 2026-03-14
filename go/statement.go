@@ -64,7 +64,7 @@ func (s *statementImpl) ExecuteUpdate(ctx context.Context) (int64, error) {
 
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return -1, nil
+		return -1, s.ErrorHelper.Errorf(adbc.StatusIO, "failed to get rows affected: %s", err)
 	}
 	return affected, nil
 }
