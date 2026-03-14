@@ -117,6 +117,12 @@ func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		return nil, db.ErrorHelper.Errorf(adbc.StatusIO, "failed to ping Oracle: %s", err)
 	}
 
+	// Register SDO_GEOMETRY UDT so go-ora can decode geometry columns directly
+	if err := RegisterSDOTypes(sqlDB); err != nil {
+		// Non-fatal: geometry columns will fall back to query rewriting
+		db.Logger.Warn("SDO_GEOMETRY UDT registration failed, using query rewriting fallback", "error", err)
+	}
+
 	cnxnBase := driverbase.NewConnectionImplBase(&db.DatabaseImplBase)
 	cnxn := &connectionImpl{
 		ConnectionImplBase: cnxnBase,

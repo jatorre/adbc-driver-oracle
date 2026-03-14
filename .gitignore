@@ -5,3 +5,4 @@
 *.exe
 /build/
 /oracle-adbc-test
+trace.log
