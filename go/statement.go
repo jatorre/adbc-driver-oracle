@@ -26,6 +26,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	go_ora "github.com/sijms/go-ora/v2"
 )
 
 type statementImpl struct {
@@ -267,12 +268,19 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 		return -1, err
 	}
 
-	// Build INSERT statement: INSERT INTO table (col1, col2, ...) VALUES (:1, :2, ...)
+	// Build INSERT statement.
+	// Geometry columns use SDO_UTIL.FROM_WKBGEOMETRY(:N) for WKB→SDO_GEOMETRY conversion.
 	colNames := make([]string, schema.NumFields())
 	placeholders := make([]string, schema.NumFields())
+	geomCols := make(map[int]bool)
 	for i, f := range schema.Fields() {
 		colNames[i] = fmt.Sprintf(`"%s"`, strings.ToUpper(f.Name))
-		placeholders[i] = fmt.Sprintf(":%d", i+1)
+		if isGeometryColumn(f) {
+			placeholders[i] = fmt.Sprintf("SDO_UTIL.FROM_WKBGEOMETRY(:%d)", i+1)
+			geomCols[i] = true
+		} else {
+			placeholders[i] = fmt.Sprintf(":%d", i+1)
+		}
 	}
 	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
 		tableName,
@@ -317,7 +325,8 @@ func (s *statementImpl) insertBatch(ctx context.Context, stmt *sql.Stmt, rec arr
 	numCols := int(rec.NumCols())
 
 	// Build columnar arrays for go-ora batch insert.
-	// go-ora's batch mode: pass slices as args, one slice per column.
+	// Geometry columns are passed as raw WKB []byte — the INSERT SQL
+	// wraps them with SDO_UTIL.FROM_WKBGEOMETRY().
 	args := make([]interface{}, numCols)
 	for col := 0; col < numCols; col++ {
 		arr := rec.Column(col)
@@ -337,7 +346,19 @@ func (s *statementImpl) insertBatch(ctx context.Context, stmt *sql.Stmt, rec arr
 }
 
 // arrowColumnToSlice converts an Arrow array to a Go slice for go-ora batch insert.
+// For geometry columns (isGeom=true), WKB binary is converted to SdoGeometry UDT objects.
 func arrowColumnToSlice(arr arrow.Array, numRows int) interface{} {
+	return arrowColumnToSliceWithGeom(arr, numRows, false, 4326)
+}
+
+func arrowColumnToSliceGeom(arr arrow.Array, numRows int, srid int64) interface{} {
+	return arrowColumnToSliceWithGeom(arr, numRows, true, srid)
+}
+
+func arrowColumnToSliceWithGeom(arr arrow.Array, numRows int, isGeom bool, srid int64) interface{} {
+	if isGeom {
+		return wkbColumnToSdoSlice(arr, numRows, srid)
+	}
 	switch a := arr.(type) {
 	case *array.Int64:
 		vals := make([]sql.NullInt64, numRows)
@@ -412,6 +433,32 @@ func arrowColumnToSlice(arr arrow.Array, numRows int) interface{} {
 	}
 }
 
+// wkbColumnToSdoSlice converts a WKB binary column to a slice of go-ora Objects
+// containing SdoGeometry structs for direct UDT insert.
+func wkbColumnToSdoSlice(arr arrow.Array, numRows int, srid int64) interface{} {
+	binArr, ok := arr.(*array.Binary)
+	if !ok {
+		// Fallback: return nil slice
+		return make([]*go_ora.Object, numRows)
+	}
+
+	vals := make([]*go_ora.Object, numRows)
+	for i := 0; i < numRows; i++ {
+		if binArr.IsNull(i) {
+			vals[i] = nil
+			continue
+		}
+		wkb := binArr.Value(i)
+		geom, err := WKBToSdo(wkb, srid)
+		if err != nil {
+			vals[i] = nil
+			continue
+		}
+		vals[i] = go_ora.NewObject("MDSYS", "SDO_GEOMETRY", *geom)
+	}
+	return vals
+}
+
 func (s *statementImpl) prepareIngestTable(ctx context.Context, tableName string, schema *arrow.Schema, mode string) error {
 	switch mode {
 	case adbc.OptionValueIngestModeCreate:
@@ -439,10 +486,51 @@ func (s *statementImpl) prepareIngestTable(ctx context.Context, tableName string
 	return nil
 }
 
+// isGeometryColumn checks if an Arrow field is a geometry column.
+// Detects via geoarrow.wkb extension metadata (from Arrow/ADBC) or
+// GeoParquet column naming convention (GEOM, GEOMETRY, geom, geometry).
+func isGeometryColumn(f arrow.Field) bool {
+	if f.Type.ID() != arrow.BINARY {
+		return false
+	}
+	// Check geoarrow.wkb extension metadata
+	extName, ok := f.Metadata.GetValue("ARROW:extension:name")
+	if ok && extName == "geoarrow.wkb" {
+		return true
+	}
+	// Check common geometry column names (GeoParquet convention)
+	name := strings.ToUpper(f.Name)
+	return name == "GEOM" || name == "GEOMETRY" || name == "GEOM_WKB" || name == "WKB_GEOMETRY"
+}
+
+// extractSRIDFromField extracts the SRID from geoarrow extension metadata.
+func extractSRIDFromField(f arrow.Field) int64 {
+	meta, ok := f.Metadata.GetValue("ARROW:extension:metadata")
+	if !ok || meta == "{}" {
+		return 4326 // default
+	}
+	// Simple extraction — look for "code":NNNN
+	idx := strings.Index(meta, `"code":`)
+	if idx < 0 {
+		return 4326
+	}
+	var srid int64
+	fmt.Sscanf(meta[idx+7:], "%d", &srid)
+	if srid == 0 {
+		return 4326
+	}
+	return srid
+}
+
 func buildCreateTableDDL(tableName string, schema *arrow.Schema) string {
 	var cols []string
 	for _, f := range schema.Fields() {
-		oraType := arrowToOracleType(f.Type)
+		var oraType string
+		if isGeometryColumn(f) {
+			oraType = "MDSYS.SDO_GEOMETRY"
+		} else {
+			oraType = arrowToOracleType(f.Type)
+		}
 		nullable := ""
 		if !f.Nullable {
 			nullable = " NOT NULL"
