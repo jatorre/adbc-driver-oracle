@@ -9,6 +9,11 @@ require (
 	github.com/sijms/go-ora/v2 v2.8.24
 )
 
+// TODO: Remove this replace once go-ora PR #720 is merged upstream.
+// https://github.com/sijms/go-ora/pull/720
+// Fix: null VARRAY encoding in nested UDT structs (required for SDO_GEOMETRY point insert)
+replace github.com/sijms/go-ora/v2 => github.com/jatorre/go-ora/v2 v2.8.25-0.20260314200957-577e2cf2847e
+
 require (
 	github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20251215145213-df04bfe8de4f // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect

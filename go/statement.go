@@ -45,7 +45,8 @@ type statementImpl struct {
 
 	// Ingest options
 	ingestTargetTable string
-	ingestMode        string // "create", "append", "replace", "create_append"
+	ingestMode        string
+	ingestGeomCols    map[int]int64 // col index → srid for geometry columns
 }
 
 func (s *statementImpl) Base() *driverbase.StatementImplBase {
@@ -269,17 +270,15 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 	}
 
 	// Build INSERT statement.
-	// Geometry columns use SDO_UTIL.FROM_WKBGEOMETRY(:N) for WKB→SDO_GEOMETRY conversion.
+	// Geometry columns use direct SdoGeometry UDT insert (no server-side conversion).
 	colNames := make([]string, schema.NumFields())
 	placeholders := make([]string, schema.NumFields())
-	geomCols := make(map[int]bool)
+	geomCols := make(map[int]int64) // col index → srid
 	for i, f := range schema.Fields() {
 		colNames[i] = fmt.Sprintf(`"%s"`, strings.ToUpper(f.Name))
+		placeholders[i] = fmt.Sprintf(":%d", i+1)
 		if isGeometryColumn(f) {
-			placeholders[i] = fmt.Sprintf("SDO_UTIL.FROM_WKBGEOMETRY(:%d)", i+1)
-			geomCols[i] = true
-		} else {
-			placeholders[i] = fmt.Sprintf(":%d", i+1)
+			geomCols[i] = extractSRIDFromField(f)
 		}
 	}
 	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
@@ -294,6 +293,7 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 	}
 	defer stmt.Close()
 
+	s.ingestGeomCols = geomCols
 	var totalRows int64
 
 	if s.bindStream != nil {
@@ -325,12 +325,15 @@ func (s *statementImpl) insertBatch(ctx context.Context, stmt *sql.Stmt, rec arr
 	numCols := int(rec.NumCols())
 
 	// Build columnar arrays for go-ora batch insert.
-	// Geometry columns are passed as raw WKB []byte — the INSERT SQL
-	// wraps them with SDO_UTIL.FROM_WKBGEOMETRY().
+	// Geometry columns are converted WKB→SdoGeometry and passed as go_ora.Object.
 	args := make([]interface{}, numCols)
 	for col := 0; col < numCols; col++ {
 		arr := rec.Column(col)
-		args[col] = arrowColumnToSlice(arr, numRows)
+		if srid, ok := s.ingestGeomCols[col]; ok {
+			args[col] = wkbColumnToSdoSlice(arr, numRows, srid)
+		} else {
+			args[col] = arrowColumnToSlice(arr, numRows)
+		}
 	}
 
 	_, err := stmt.ExecContext(ctx, args...)
