@@ -42,6 +42,7 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 
 	impl := &oracleRecordReader{
 		rows: rows,
+		db:   s.cnxn.db,
 	}
 
 	var rr driverbase.BaseRecordReader
@@ -105,14 +106,11 @@ func (s *statementImpl) Close() error {
 // It handles both regular columns and SDO_GEOMETRY columns (via UDT registration).
 type oracleRecordReader struct {
 	rows     *sql.Rows
+	db       *sql.DB
 	colTypes []*sql.ColumnType
 	scanDest []interface{}
 	scanVals []interface{}
-	// geomIndices tracks which columns are SDO_GEOMETRY (UDT registered as XMLType)
 	geomIndices []int
-	// srid detected from first non-null geometry
-	srid         int64
-	sridDetected bool
 }
 
 func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.RecordBatch, rowIdx int) (*arrow.Schema, error) {
@@ -125,14 +123,26 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 	fields := make([]arrow.Field, len(colTypes))
 	r.geomIndices = nil
 
+	// First pass: detect geometry columns
+	for i, ct := range colTypes {
+		if strings.ToUpper(ct.DatabaseTypeName()) == "XMLTYPE" {
+			r.geomIndices = append(r.geomIndices, i)
+		}
+	}
+
+	// Probe SRID from Oracle metadata if we have geometry columns
+	var srid int64
+	if len(r.geomIndices) > 0 {
+		srid = r.probeSRID(colTypes[r.geomIndices[0]].Name())
+	}
+
+	// Build schema
 	for i, ct := range colTypes {
 		nullable, _ := ct.Nullable()
 		dbType := strings.ToUpper(ct.DatabaseTypeName())
 
 		if dbType == "XMLTYPE" {
-			// go-ora labels registered UDTs as XMLType — this is our SDO_GEOMETRY
-			r.geomIndices = append(r.geomIndices, i)
-			fields[i] = GeoArrowWKBField(ct.Name(), 0, nullable)
+			fields[i] = GeoArrowWKBField(ct.Name(), srid, nullable)
 		} else {
 			fields[i] = arrow.Field{
 				Name:     ct.Name(),
@@ -199,12 +209,6 @@ func (r *oracleRecordReader) appendGeometry(fieldBuilder array.Builder, val inte
 		return 0
 	}
 
-	// Detect SRID from first non-null geometry
-	if !r.sridDetected && geom.SRID != 0 {
-		r.srid = geom.SRID
-		r.sridDetected = true
-	}
-
 	wkb, err := SdoToWKB(&geom)
 	if err != nil {
 		fieldBuilder.AppendNull()
@@ -213,6 +217,25 @@ func (r *oracleRecordReader) appendGeometry(fieldBuilder array.Builder, val inte
 
 	fieldBuilder.(*array.BinaryBuilder).Append(wkb)
 	return int64(len(wkb))
+}
+
+// probeSRID queries Oracle metadata for the SRID of a geometry column.
+func (r *oracleRecordReader) probeSRID(geomColName string) int64 {
+	if r.db == nil {
+		return 0
+	}
+
+	// Query SRID from SDO_GEOM_METADATA (scalar-only columns to avoid UDT decode issues)
+	var srid sql.NullInt64
+	err := r.db.QueryRow(
+		`SELECT SRID FROM ALL_SDO_GEOM_METADATA WHERE UPPER(COLUMN_NAME) = :1 AND ROWNUM <= 1`,
+		strings.ToUpper(geomColName),
+	).Scan(&srid)
+	if err == nil && srid.Valid {
+		return srid.Int64
+	}
+
+	return 0
 }
 
 func (r *oracleRecordReader) Close() error {
