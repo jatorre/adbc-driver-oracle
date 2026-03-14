@@ -74,7 +74,12 @@ func (s *statementImpl) ExecuteSchema(ctx context.Context) (*arrow.Schema, error
 }
 
 func (s *statementImpl) Prepare(ctx context.Context) error {
-	return s.ErrorHelper.Errorf(adbc.StatusNotImplemented, "Prepare")
+	// Oracle doesn't require explicit prepare — queries are prepared implicitly.
+	// Just validate we have a query set.
+	if s.query == "" {
+		return s.ErrorHelper.Errorf(adbc.StatusInvalidState, "no query set")
+	}
+	return nil
 }
 
 func (s *statementImpl) SetSubstraitPlan(plan []byte) error {
