@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
@@ -23,6 +24,7 @@ import (
 func main() {
 	dsn := flag.String("dsn", "", "Oracle DSN (oracle://user:pass@host:port/service)")
 	query := flag.String("query", "SELECT 1 FROM DUAL", "SQL query to execute")
+	benchmark := flag.Bool("benchmark", false, "Print throughput stats")
 	flag.Parse()
 
 	if *dsn == "" {
@@ -71,18 +73,43 @@ func main() {
 	schema := reader.Schema()
 	fmt.Printf("Schema: %s\n", schema)
 
+	start := time.Now()
 	totalRows := 0
+	printedRows := 0
 	for reader.Next() {
 		rec := reader.Record()
-		totalRows += int(rec.NumRows())
-		if totalRows <= 10 {
-			fmt.Println(rec)
+		nRows := int(rec.NumRows())
+		totalRows += nRows
+
+		// Print first 20 rows in tabular form (unless benchmarking)
+		if !*benchmark {
+			for row := 0; row < nRows && printedRows < 20; row++ {
+				for col := 0; col < int(rec.NumCols()); col++ {
+					if col > 0 {
+						fmt.Print("\t")
+					}
+					arr := rec.Column(col)
+					if arr.IsNull(row) {
+						fmt.Print("NULL")
+					} else {
+						fmt.Print(arr.ValueStr(row))
+					}
+				}
+				fmt.Println()
+				printedRows++
+			}
 		}
 	}
+	elapsed := time.Since(start)
 	if err := reader.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "Reader error: %v\n", err)
 		os.Exit(1)
 	}
 
 	fmt.Printf("\nTotal rows: %d\n", totalRows)
+	if *benchmark && totalRows > 0 {
+		rowsPerSec := float64(totalRows) / elapsed.Seconds()
+		fmt.Printf("Elapsed: %s\n", elapsed.Round(time.Millisecond))
+		fmt.Printf("Throughput: %.0f rows/sec\n", rowsPerSec)
+	}
 }

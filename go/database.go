@@ -48,6 +48,15 @@ func (db *databaseImpl) SetOption(key string, val string) error {
 	return nil
 }
 
+func (db *databaseImpl) SetOptions(options map[string]string) error {
+	for key, val := range options {
+		if err := db.SetOption(key, val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (db *databaseImpl) GetOption(key string) (string, error) {
 	switch key {
 	case OptionServerHostname:
@@ -80,6 +89,8 @@ func (db *databaseImpl) buildDSN() string {
 	)
 
 	params := url.Values{}
+	// Default prefetch for good throughput (go-ora default is too low)
+	params.Set("PREFETCH_ROWS", "10000")
 	if db.walletLocation != "" {
 		params.Set("WALLET", db.walletLocation)
 	}

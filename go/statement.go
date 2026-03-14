@@ -110,8 +110,12 @@ type oracleRecordReader struct {
 }
 
 func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.RecordBatch, rowIdx int) (*arrow.Schema, error) {
-	schema, _, err := buildSchemaFromRows(r.rows)
-	return schema, err
+	schema, colTypes, err := buildSchemaFromRows(r.rows)
+	if err != nil {
+		return nil, err
+	}
+	r.colTypes = colTypes
+	return schema, nil
 }
 
 func (r *oracleRecordReader) BeginAppending(builder *array.RecordBuilder) error {

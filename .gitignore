@@ -4,3 +4,4 @@
 *.h
 *.exe
 /build/
+/oracle-adbc-test

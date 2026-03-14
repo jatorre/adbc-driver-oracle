@@ -3,7 +3,7 @@ package oracle
 import (
 	"database/sql"
 	"fmt"
-	"math"
+	"strconv"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -52,7 +52,18 @@ func appendInt64(b *array.Int64Builder, val interface{}) int64 {
 	case float32:
 		b.Append(int64(v))
 	case string:
-		b.AppendNull()
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			// Try parsing as float then truncate
+			f, ferr := strconv.ParseFloat(v, 64)
+			if ferr != nil {
+				b.AppendNull()
+			} else {
+				b.Append(int64(f))
+			}
+		} else {
+			b.Append(i)
+		}
 	default:
 		b.AppendNull()
 	}
@@ -72,7 +83,12 @@ func appendFloat64(b *array.Float64Builder, val interface{}) int64 {
 	case int:
 		b.Append(float64(v))
 	case string:
-		b.Append(math.NaN())
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			b.AppendNull()
+		} else {
+			b.Append(f)
+		}
 	default:
 		b.AppendNull()
 	}
