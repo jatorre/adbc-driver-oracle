@@ -42,7 +42,6 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 
 	impl := &oracleRecordReader{
 		rows: rows,
-		db:   s.cnxn.db,
 	}
 
 	var rr driverbase.BaseRecordReader
@@ -106,11 +105,13 @@ func (s *statementImpl) Close() error {
 // It handles both regular columns and SDO_GEOMETRY columns (via UDT registration).
 type oracleRecordReader struct {
 	rows     *sql.Rows
-	db       *sql.DB
 	colTypes []*sql.ColumnType
 	scanDest []interface{}
 	scanVals []interface{}
 	geomIndices []int
+	// firstRow holds a peeked first row (used to detect SRID before schema creation)
+	firstRow     []interface{}
+	hasFirstRow  bool
 }
 
 func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.RecordBatch, rowIdx int) (*arrow.Schema, error) {
@@ -123,17 +124,18 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 	fields := make([]arrow.Field, len(colTypes))
 	r.geomIndices = nil
 
-	// First pass: detect geometry columns
+	// Detect geometry columns
 	for i, ct := range colTypes {
 		if strings.ToUpper(ct.DatabaseTypeName()) == "XMLTYPE" {
 			r.geomIndices = append(r.geomIndices, i)
 		}
 	}
 
-	// Probe SRID from Oracle metadata if we have geometry columns
+	// If there are geometry columns, peek at the first row to get the SRID
+	// from the SdoGeometry struct itself — no extra query needed.
 	var srid int64
 	if len(r.geomIndices) > 0 {
-		srid = r.probeSRID(colTypes[r.geomIndices[0]].Name())
+		srid = r.peekSRID()
 	}
 
 	// Build schema
@@ -166,15 +168,22 @@ func (r *oracleRecordReader) BeginAppending(builder *array.RecordBuilder) error 
 }
 
 func (r *oracleRecordReader) AppendRow(builder *array.RecordBuilder) (int64, error) {
-	if !r.rows.Next() {
-		if err := r.rows.Err(); err != nil {
-			return 0, err
+	// Replay peeked first row if available
+	if r.hasFirstRow {
+		r.hasFirstRow = false
+		copy(r.scanVals, r.firstRow)
+		r.firstRow = nil
+	} else {
+		if !r.rows.Next() {
+			if err := r.rows.Err(); err != nil {
+				return 0, err
+			}
+			return 0, io.EOF
 		}
-		return 0, io.EOF
-	}
 
-	if err := r.rows.Scan(r.scanDest...); err != nil {
-		return 0, fmt.Errorf("scan error: %w", err)
+		if err := r.rows.Scan(r.scanDest...); err != nil {
+			return 0, fmt.Errorf("scan error: %w", err)
+		}
 	}
 
 	var rowSize int64
@@ -219,22 +228,34 @@ func (r *oracleRecordReader) appendGeometry(fieldBuilder array.Builder, val inte
 	return int64(len(wkb))
 }
 
-// probeSRID queries Oracle metadata for the SRID of a geometry column.
-func (r *oracleRecordReader) probeSRID(geomColName string) int64 {
-	if r.db == nil {
+// peekSRID reads the first row to extract the SRID from the first non-null geometry.
+// The row is saved so AppendRow can replay it.
+func (r *oracleRecordReader) peekSRID() int64 {
+	if !r.rows.Next() {
 		return 0
 	}
 
-	// Query SRID from SDO_GEOM_METADATA (scalar-only columns to avoid UDT decode issues)
-	var srid sql.NullInt64
-	err := r.db.QueryRow(
-		`SELECT SRID FROM ALL_SDO_GEOM_METADATA WHERE UPPER(COLUMN_NAME) = :1 AND ROWNUM <= 1`,
-		strings.ToUpper(geomColName),
-	).Scan(&srid)
-	if err == nil && srid.Valid {
-		return srid.Int64
+	n := len(r.colTypes)
+	dest := make([]interface{}, n)
+	vals := make([]interface{}, n)
+	for i := range dest {
+		dest[i] = &vals[i]
 	}
 
+	if err := r.rows.Scan(dest...); err != nil {
+		return 0
+	}
+
+	// Save the row so AppendRow replays it
+	r.firstRow = vals
+	r.hasFirstRow = true
+
+	// Find SRID from first geometry column
+	for _, idx := range r.geomIndices {
+		if geom, ok := vals[idx].(SdoGeometry); ok && geom.SRID != 0 {
+			return geom.SRID
+		}
+	}
 	return 0
 }
 
