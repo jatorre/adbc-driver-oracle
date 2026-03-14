@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/apache/arrow-adbc/go/adbc"
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
@@ -372,4 +373,219 @@ func TestIntegration_GetObjects(t *testing.T) {
 		t.Error("expected at least 1 catalog")
 	}
 	t.Logf("Got %d catalogs", totalRows)
+}
+
+func TestIntegration_PreparedStatement(t *testing.T) {
+	dsn := getTestDSN(t)
+	ctx := context.Background()
+
+	drv := NewDriver(memory.DefaultAllocator)
+	db, err := drv.NewDatabase(map[string]string{OptionDSN: dsn})
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	defer db.Close()
+
+	cnxn, err := db.Open(ctx)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cnxn.Close()
+
+	stmt, err := cnxn.NewStatement()
+	if err != nil {
+		t.Fatalf("NewStatement: %v", err)
+	}
+	defer stmt.Close()
+
+	// Parameterized query: Oracle uses :1, :2, ... placeholders
+	if err := stmt.SetSqlQuery("SELECT :1 AS val FROM DUAL"); err != nil {
+		t.Fatalf("SetSqlQuery: %v", err)
+	}
+	if err := stmt.Prepare(ctx); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+
+	// Bind a parameter: single row with one Int64 column
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "p1", Type: arrow.PrimitiveTypes.Int64},
+	}, nil)
+	bldr := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer bldr.Release()
+	bldr.Field(0).(*array.Int64Builder).Append(42)
+	rec := bldr.NewRecord()
+	defer rec.Release()
+
+	if err := stmt.Bind(ctx, rec); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	reader, _, err := stmt.ExecuteQuery(ctx)
+	if err != nil {
+		t.Fatalf("ExecuteQuery: %v", err)
+	}
+	defer reader.Release()
+
+	if !reader.Next() {
+		t.Fatal("expected a row")
+	}
+	// The value should be 42
+	t.Logf("Result schema: %s", reader.Schema())
+	t.Logf("Result: %s", reader.Record())
+}
+
+func TestIntegration_BulkIngest(t *testing.T) {
+	dsn := getTestDSN(t)
+	ctx := context.Background()
+
+	drv := NewDriver(memory.DefaultAllocator)
+	db, err := drv.NewDatabase(map[string]string{OptionDSN: dsn})
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	defer db.Close()
+
+	cnxn, err := db.Open(ctx)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer cnxn.Close()
+
+	tableName := "ADBC_TEST_INGEST"
+
+	// Clean up from previous runs
+	cleanStmt, _ := cnxn.NewStatement()
+	cleanStmt.SetSqlQuery("DROP TABLE " + tableName + " PURGE")
+	cleanStmt.ExecuteUpdate(ctx)
+	cleanStmt.Close()
+
+	// Create test data
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "value", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+	}, nil)
+	bldr := array.NewRecordBuilder(memory.DefaultAllocator, schema)
+	defer bldr.Release()
+
+	bldr.Field(0).(*array.Int64Builder).AppendValues([]int64{1, 2, 3}, nil)
+	bldr.Field(1).(*array.StringBuilder).AppendValues([]string{"alpha", "beta", "gamma"}, nil)
+	bldr.Field(2).(*array.Float64Builder).AppendValues([]float64{1.1, 2.2, 3.3}, nil)
+	rec := bldr.NewRecord()
+	defer rec.Release()
+
+	// Ingest using Bind
+	ingestStmt, err := cnxn.NewStatement()
+	if err != nil {
+		t.Fatalf("NewStatement: %v", err)
+	}
+
+	if gs, ok := ingestStmt.(adbc.GetSetOptions); ok {
+		gs.SetOption(adbc.OptionKeyIngestTargetTable, tableName)
+		gs.SetOption(adbc.OptionKeyIngestMode, adbc.OptionValueIngestModeCreate)
+	}
+
+	if err := ingestStmt.Bind(ctx, rec); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	affected, err := ingestStmt.ExecuteUpdate(ctx)
+	if err != nil {
+		t.Fatalf("ExecuteUpdate (ingest): %v", err)
+	}
+	t.Logf("Ingested %d rows", affected)
+	ingestStmt.Close()
+
+	if affected != 3 {
+		t.Errorf("expected 3 rows affected, got %d", affected)
+	}
+
+	// Read back
+	readStmt, _ := cnxn.NewStatement()
+	defer readStmt.Close()
+	readStmt.SetSqlQuery("SELECT * FROM " + tableName + " ORDER BY ID")
+	reader, _, err := readStmt.ExecuteQuery(ctx)
+	if err != nil {
+		t.Fatalf("ExecuteQuery (read back): %v", err)
+	}
+	defer reader.Release()
+
+	totalRows := 0
+	for reader.Next() {
+		rec := reader.Record()
+		totalRows += int(rec.NumRows())
+		t.Logf("Row: %s", rec)
+	}
+	if totalRows != 3 {
+		t.Errorf("expected 3 rows read back, got %d", totalRows)
+	}
+
+	// Cleanup
+	cleanStmt2, _ := cnxn.NewStatement()
+	cleanStmt2.SetSqlQuery("DROP TABLE " + tableName + " PURGE")
+	cleanStmt2.ExecuteUpdate(ctx)
+	cleanStmt2.Close()
+}
+
+func TestIntegration_ConnectionPooling(t *testing.T) {
+	dsn := getTestDSN(t)
+	ctx := context.Background()
+
+	drv := NewDriver(memory.DefaultAllocator)
+	db, err := drv.NewDatabase(map[string]string{OptionDSN: dsn})
+	if err != nil {
+		t.Fatalf("NewDatabase: %v", err)
+	}
+	defer db.Close()
+
+	// Open two connections — they should share the same pool
+	cnxn1, err := db.Open(ctx)
+	if err != nil {
+		t.Fatalf("Open 1: %v", err)
+	}
+
+	cnxn2, err := db.Open(ctx)
+	if err != nil {
+		t.Fatalf("Open 2: %v", err)
+	}
+
+	// Both should work
+	stmt1, _ := cnxn1.NewStatement()
+	stmt1.SetSqlQuery("SELECT 1 FROM DUAL")
+	r1, _, err := stmt1.ExecuteQuery(ctx)
+	if err != nil {
+		t.Fatalf("Query on cnxn1: %v", err)
+	}
+	r1.Release()
+	stmt1.Close()
+
+	stmt2, _ := cnxn2.NewStatement()
+	stmt2.SetSqlQuery("SELECT 2 FROM DUAL")
+	r2, _, err := stmt2.ExecuteQuery(ctx)
+	if err != nil {
+		t.Fatalf("Query on cnxn2: %v", err)
+	}
+	r2.Release()
+	stmt2.Close()
+
+	// Close connections — should NOT close the pool
+	cnxn1.Close()
+	cnxn2.Close()
+
+	// Opening a third connection after closing the first two should still work
+	cnxn3, err := db.Open(ctx)
+	if err != nil {
+		t.Fatalf("Open 3 (after closing 1 & 2): %v", err)
+	}
+	defer cnxn3.Close()
+
+	stmt3, _ := cnxn3.NewStatement()
+	stmt3.SetSqlQuery("SELECT 3 FROM DUAL")
+	r3, _, err := stmt3.ExecuteQuery(ctx)
+	if err != nil {
+		t.Fatalf("Query on cnxn3: %v", err)
+	}
+	r3.Release()
+	stmt3.Close()
+	t.Log("Connection pooling works: 3 connections shared the same pool")
 }

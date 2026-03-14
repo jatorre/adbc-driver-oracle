@@ -26,7 +26,8 @@ import (
 
 type connectionImpl struct {
 	driverbase.ConnectionImplBase
-	db *sql.DB
+	db     *sql.DB
+	ownsDB bool // if true, Close() closes the db; if false, pool is shared
 }
 
 func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
@@ -267,11 +268,13 @@ func (c *connectionImpl) Rollback(ctx context.Context) error {
 }
 
 func (c *connectionImpl) Close() error {
-	if c.db != nil {
+	// Don't close the shared pool — it's owned by the database
+	if c.ownsDB && c.db != nil {
 		err := c.db.Close()
 		c.db = nil
 		return err
 	}
+	c.db = nil
 	return nil
 }
 

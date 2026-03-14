@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/url"
+	"sync"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
@@ -36,6 +37,12 @@ type databaseImpl struct {
 	walletLocation string
 	walletPassword string
 	dsn            string
+
+	// Connection pool — shared across all Open() calls.
+	// sql.DB is already a pool internally; we create it once and reuse.
+	pool     *sql.DB
+	poolOnce sync.Once
+	poolErr  error
 }
 
 func (db *databaseImpl) SetOption(key string, val string) error {
@@ -93,7 +100,6 @@ func (db *databaseImpl) buildDSN() string {
 		return db.dsn
 	}
 
-	// Build oracle://user:pass@host:port/service_name?params
 	dsn := fmt.Sprintf("oracle://%s:%s@%s:%s/%s",
 		url.PathEscape(db.user),
 		url.PathEscape(db.password),
@@ -103,7 +109,6 @@ func (db *databaseImpl) buildDSN() string {
 	)
 
 	params := url.Values{}
-	// Default prefetch for good throughput (go-ora default is too low)
 	params.Set("PREFETCH_ROWS", "10000")
 	if db.walletLocation != "" {
 		params.Set("WALLET", db.walletLocation)
@@ -118,29 +123,43 @@ func (db *databaseImpl) buildDSN() string {
 	return dsn
 }
 
+// getPool returns the shared connection pool, creating it on first call.
+func (db *databaseImpl) getPool(ctx context.Context) (*sql.DB, error) {
+	db.poolOnce.Do(func() {
+		dsn := db.buildDSN()
+		pool, err := sql.Open("oracle", dsn)
+		if err != nil {
+			db.poolErr = fmt.Errorf("failed to open Oracle connection pool: %w", err)
+			return
+		}
+
+		if err := pool.PingContext(ctx); err != nil {
+			pool.Close()
+			db.poolErr = fmt.Errorf("failed to ping Oracle: %w", err)
+			return
+		}
+
+		// Register SDO_GEOMETRY UDT so go-ora can decode geometry columns
+		if err := RegisterSDOTypes(pool); err != nil {
+			db.Logger.Warn("SDO_GEOMETRY UDT registration failed", "error", err)
+		}
+
+		db.pool = pool
+	})
+	return db.pool, db.poolErr
+}
+
 func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
-	dsn := db.buildDSN()
-
-	sqlDB, err := sql.Open("oracle", dsn)
+	pool, err := db.getPool(ctx)
 	if err != nil {
-		return nil, db.ErrorHelper.Errorf(adbc.StatusIO, "failed to open Oracle connection: %s", err)
-	}
-
-	if err := sqlDB.PingContext(ctx); err != nil {
-		sqlDB.Close()
-		return nil, db.ErrorHelper.Errorf(adbc.StatusIO, "failed to ping Oracle: %s", err)
-	}
-
-	// Register SDO_GEOMETRY UDT so go-ora can decode geometry columns directly
-	if err := RegisterSDOTypes(sqlDB); err != nil {
-		// Non-fatal: geometry columns will fall back to query rewriting
-		db.Logger.Warn("SDO_GEOMETRY UDT registration failed, using query rewriting fallback", "error", err)
+		return nil, db.ErrorHelper.Errorf(adbc.StatusIO, "%s", err)
 	}
 
 	cnxnBase := driverbase.NewConnectionImplBase(&db.DatabaseImplBase)
 	cnxn := &connectionImpl{
 		ConnectionImplBase: cnxnBase,
-		db:                 sqlDB,
+		db:                 pool,
+		ownsDB:             false, // pool is owned by the database, not the connection
 	}
 
 	return driverbase.NewConnectionBuilder(cnxn).
@@ -151,5 +170,10 @@ func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 }
 
 func (db *databaseImpl) Close() error {
+	if db.pool != nil {
+		err := db.pool.Close()
+		db.pool = nil
+		return err
+	}
 	return db.DatabaseImplBase.Close()
 }
