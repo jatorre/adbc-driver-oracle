@@ -35,13 +35,21 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 		return nil, -1, s.ErrorHelper.Errorf(adbc.StatusInvalidState, "no query set")
 	}
 
-	rows, err := s.cnxn.db.QueryContext(ctx, s.query)
+	// Detect SDO_GEOMETRY columns and rewrite query if needed
+	rewrite, err := detectAndRewriteQuery(ctx, s.cnxn.db, s.query)
+	if err != nil {
+		return nil, -1, s.ErrorHelper.Errorf(adbc.StatusInternal, "query rewrite failed: %s", err)
+	}
+
+	rows, err := s.cnxn.db.QueryContext(ctx, rewrite.RewrittenQuery)
 	if err != nil {
 		return nil, -1, s.ErrorHelper.Errorf(adbc.StatusIO, "query execution failed: %s", err)
 	}
 
 	impl := &oracleRecordReader{
-		rows: rows,
+		rows:        rows,
+		rewrite:     rewrite,
+		hasGeometry: len(rewrite.GeomColumns) > 0,
 	}
 
 	var rr driverbase.BaseRecordReader
@@ -103,13 +111,20 @@ func (s *statementImpl) Close() error {
 
 // oracleRecordReader implements driverbase.RecordReaderImpl
 type oracleRecordReader struct {
-	rows     *sql.Rows
-	colTypes []*sql.ColumnType
-	scanDest []interface{}
-	scanVals []interface{}
+	rows        *sql.Rows
+	colTypes    []*sql.ColumnType
+	scanDest    []interface{}
+	scanVals    []interface{}
+	rewrite     *queryRewriteResult
+	hasGeometry bool
+	sridSeen    int64
+	sridDetected bool
 }
 
 func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.RecordBatch, rowIdx int) (*arrow.Schema, error) {
+	if r.hasGeometry {
+		return r.buildGeometrySchema()
+	}
 	schema, colTypes, err := buildSchemaFromRows(r.rows)
 	if err != nil {
 		return nil, err
@@ -118,8 +133,52 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 	return schema, nil
 }
 
+// buildGeometrySchema builds the Arrow schema for a query with rewritten geometry columns.
+// The rewritten query has expanded geometry columns into 7 fields each.
+// The output schema collapses those back into single geoarrow.wkb binary columns.
+func (r *oracleRecordReader) buildGeometrySchema() (*arrow.Schema, error) {
+	colTypes, err := r.rows.ColumnTypes()
+	if err != nil {
+		return nil, err
+	}
+	r.colTypes = colTypes
+
+	// Build a mapping from rewritten column positions to output fields.
+	// The rewritten query has extra columns for geometry decomposition.
+	// We need to produce the original schema with geometry columns as geoarrow.wkb.
+	var fields []arrow.Field
+
+	rewrittenIdx := 0
+	geomIdx := 0
+
+	for _, origName := range r.rewrite.OriginalSchema {
+		isGeom := false
+		if geomIdx < len(r.rewrite.GeomColumns) && r.rewrite.GeomColumns[geomIdx].FieldIndex == rewrittenIdx {
+			isGeom = true
+		}
+
+		if isGeom {
+			fields = append(fields, GeoArrowWKBField(origName, 0, true))
+			rewrittenIdx += geomFieldsPerColumn
+			geomIdx++
+		} else {
+			ct := colTypes[rewrittenIdx]
+			nullable, _ := ct.Nullable()
+			fields = append(fields, arrow.Field{
+				Name:     origName,
+				Type:     oracleTypeToArrow(ct),
+				Nullable: nullable,
+			})
+			rewrittenIdx++
+		}
+	}
+
+	return arrow.NewSchema(fields, nil), nil
+}
+
 func (r *oracleRecordReader) BeginAppending(builder *array.RecordBuilder) error {
-	n := builder.Schema().NumFields()
+	// Allocate scan buffers for ALL columns in the rewritten query
+	n := len(r.colTypes)
 	r.scanDest = make([]interface{}, n)
 	r.scanVals = make([]interface{}, n)
 	for i := range r.scanDest {
@@ -140,10 +199,57 @@ func (r *oracleRecordReader) AppendRow(builder *array.RecordBuilder) (int64, err
 		return 0, fmt.Errorf("scan error: %w", err)
 	}
 
+	if r.hasGeometry {
+		return r.appendRowWithGeometry(builder)
+	}
+
 	var rowSize int64
 	for i, val := range r.scanVals {
 		size := appendValue(builder.Field(i), val, r.colTypes[i])
 		rowSize += size
+	}
+	return rowSize, nil
+}
+
+// appendRowWithGeometry handles rows where some columns are decomposed geometry fields.
+func (r *oracleRecordReader) appendRowWithGeometry(builder *array.RecordBuilder) (int64, error) {
+	var rowSize int64
+	rewrittenIdx := 0
+	outputIdx := 0
+	geomIdx := 0
+
+	for range r.rewrite.OriginalSchema {
+		isGeom := false
+		if geomIdx < len(r.rewrite.GeomColumns) && r.rewrite.GeomColumns[geomIdx].FieldIndex == rewrittenIdx {
+			isGeom = true
+		}
+
+		if isGeom {
+			wkb, size, err := reassembleGeometry(r.scanVals, rewrittenIdx)
+			if err != nil {
+				// On error, append null
+				builder.Field(outputIdx).AppendNull()
+			} else if wkb == nil {
+				builder.Field(outputIdx).AppendNull()
+			} else {
+				builder.Field(outputIdx).(*array.BinaryBuilder).Append(wkb)
+				rowSize += size
+			}
+
+			// Detect SRID from first non-null geometry
+			if !r.sridDetected && r.scanVals[rewrittenIdx+1] != nil {
+				r.sridSeen = int64(toFloat64(r.scanVals[rewrittenIdx+1]))
+				r.sridDetected = true
+			}
+
+			rewrittenIdx += geomFieldsPerColumn
+			geomIdx++
+		} else {
+			size := appendValue(builder.Field(outputIdx), r.scanVals[rewrittenIdx], r.colTypes[rewrittenIdx])
+			rowSize += size
+			rewrittenIdx++
+		}
+		outputIdx++
 	}
 
 	return rowSize, nil
@@ -198,7 +304,6 @@ func oracleTypeToArrow(ct *sql.ColumnType) arrow.DataType {
 		return arrow.BinaryTypes.Binary
 
 	case dbType == "MDSYS.SDO_GEOMETRY" || dbType == "SDO_GEOMETRY":
-		// Phase 2: geoarrow.wkb
 		return arrow.BinaryTypes.Binary
 
 	default:
