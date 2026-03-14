@@ -271,27 +271,57 @@ func (r *oracleRecordReader) Close() error {
 	return nil
 }
 
+// timestampNoTZ is a timezone-naive timestamp (microsecond precision).
+// Used for Oracle DATE and TIMESTAMP (without time zone).
+var timestampNoTZ = &arrow.TimestampType{Unit: arrow.Microsecond}
+
 func oracleTypeToArrow(ct *sql.ColumnType) arrow.DataType {
 	dbType := strings.ToUpper(ct.DatabaseTypeName())
 
 	switch {
-	case dbType == "NUMBER" || dbType == "FLOAT" || dbType == "BINARY_FLOAT" || dbType == "BINARY_DOUBLE":
+	// Numeric types
+	case dbType == "NUMBER":
 		precision, scale, ok := ct.DecimalSize()
 		if ok && scale == 0 && precision > 0 && precision <= 18 {
 			return arrow.PrimitiveTypes.Int64
 		}
+		if ok && scale == 0 && precision > 18 {
+			// Large integers that don't fit in Int64 — preserve as string
+			return arrow.BinaryTypes.String
+		}
+		return arrow.PrimitiveTypes.Float64
+	case dbType == "FLOAT" || dbType == "BINARY_FLOAT" || dbType == "BINARY_DOUBLE":
 		return arrow.PrimitiveTypes.Float64
 
+	// String types
 	case dbType == "VARCHAR2" || dbType == "VARCHAR" || dbType == "NVARCHAR2" ||
 		dbType == "CHAR" || dbType == "NCHAR" || dbType == "CLOB" || dbType == "NCLOB" ||
 		dbType == "LONG" || dbType == "ROWID":
 		return arrow.BinaryTypes.String
 
-	case dbType == "DATE" || dbType == "TIMESTAMP" || strings.HasPrefix(dbType, "TIMESTAMP"):
+	// Date/time types — go-ora uses internal type names
+	case dbType == "DATE":
+		// Oracle DATE is date + time, no timezone
+		return timestampNoTZ
+	case dbType == "TIMESTAMPDTY" || dbType == "TIMESTAMP":
+		// Plain TIMESTAMP, no timezone
+		return timestampNoTZ
+	case dbType == "TIMESTAMPTZ_DTY" || dbType == "TIMESTAMPLTZ_DTY" ||
+		strings.HasPrefix(dbType, "TIMESTAMP"):
+		// TIMESTAMP WITH TIME ZONE / WITH LOCAL TIME ZONE → UTC
 		return arrow.FixedWidthTypes.Timestamp_us
 
+	// Interval types → string representation
+	case dbType == "INTERVALYM_DTY" || dbType == "INTERVALDS_DTY":
+		return arrow.BinaryTypes.String
+
+	// Binary types
 	case dbType == "RAW" || dbType == "LONG RAW" || dbType == "BLOB":
 		return arrow.BinaryTypes.Binary
+
+	// Boolean (Oracle 23c+)
+	case dbType == "BOOLEAN":
+		return arrow.FixedWidthTypes.Boolean
 
 	default:
 		return arrow.BinaryTypes.String

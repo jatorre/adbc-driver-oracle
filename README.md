@@ -71,14 +71,21 @@ reader, _, _ := stmt.ExecuteQuery(ctx)
 
 ## Supported Oracle Types
 
-| Oracle Type | Arrow Type |
-|------------|------------|
-| NUMBER (integer) | Int64 |
-| NUMBER (decimal), FLOAT, BINARY_FLOAT/DOUBLE | Float64 |
-| VARCHAR2, CHAR, CLOB, NVARCHAR2, NCHAR, NCLOB | String |
-| DATE, TIMESTAMP | Timestamp (microseconds) |
-| RAW, BLOB | Binary |
-| SDO_GEOMETRY | Binary (geoarrow.wkb) |
+| Oracle Type | Arrow Type | Notes |
+|------------|------------|-------|
+| NUMBER (integer, p<=18) | Int64 | |
+| NUMBER (integer, p>18) | String | Preserves full precision |
+| NUMBER (decimal), FLOAT, BINARY_FLOAT/DOUBLE | Float64 | |
+| VARCHAR2, CHAR, CLOB, NVARCHAR2, NCHAR, NCLOB | String | |
+| DATE | Timestamp (us, no TZ) | Oracle DATE is wall-clock time |
+| TIMESTAMP | Timestamp (us, no TZ) | |
+| TIMESTAMP WITH TIME ZONE | Timestamp (us, UTC) | |
+| TIMESTAMP WITH LOCAL TIME ZONE | Timestamp (us, UTC) | |
+| INTERVAL YEAR TO MONTH | String | e.g. `+03-06` |
+| INTERVAL DAY TO SECOND | String | e.g. `+05 04:03:02.000000` |
+| RAW, BLOB | Binary | |
+| BOOLEAN (Oracle 23c+) | Boolean | |
+| SDO_GEOMETRY | Binary (geoarrow.wkb) | With SRID as PROJJSON CRS |
 
 ## How Geometry Works
 

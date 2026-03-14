@@ -263,25 +263,36 @@ func (c *connectionImpl) Close() error {
 
 // --- Helpers ---
 
-// oracleDataTypeToArrow converts an Oracle data type name to an Arrow type.
+// oracleDataTypeToArrow converts an Oracle data type name (from ALL_TAB_COLUMNS) to an Arrow type.
 func oracleDataTypeToArrow(dataType string, precision, scale sql.NullInt64) arrow.DataType {
 	dt := strings.ToUpper(dataType)
 	switch {
-	case dt == "NUMBER" || dt == "FLOAT" || dt == "BINARY_FLOAT" || dt == "BINARY_DOUBLE":
+	case dt == "NUMBER":
 		if scale.Valid && scale.Int64 == 0 && precision.Valid && precision.Int64 > 0 && precision.Int64 <= 18 {
 			return arrow.PrimitiveTypes.Int64
 		}
+		if scale.Valid && scale.Int64 == 0 && precision.Valid && precision.Int64 > 18 {
+			return arrow.BinaryTypes.String
+		}
+		return arrow.PrimitiveTypes.Float64
+	case dt == "FLOAT" || dt == "BINARY_FLOAT" || dt == "BINARY_DOUBLE":
 		return arrow.PrimitiveTypes.Float64
 	case dt == "VARCHAR2" || dt == "VARCHAR" || dt == "NVARCHAR2" ||
 		dt == "CHAR" || dt == "NCHAR" || dt == "CLOB" || dt == "NCLOB" ||
 		dt == "LONG" || dt == "ROWID":
 		return arrow.BinaryTypes.String
-	case dt == "DATE" || dt == "TIMESTAMP" || strings.HasPrefix(dt, "TIMESTAMP"):
+	case dt == "DATE" || dt == "TIMESTAMP":
+		return timestampNoTZ
+	case strings.HasPrefix(dt, "TIMESTAMP"):
 		return arrow.FixedWidthTypes.Timestamp_us
+	case strings.HasPrefix(dt, "INTERVAL"):
+		return arrow.BinaryTypes.String
 	case dt == "RAW" || dt == "LONG RAW" || dt == "BLOB":
 		return arrow.BinaryTypes.Binary
 	case dt == "SDO_GEOMETRY":
 		return arrow.BinaryTypes.Binary
+	case dt == "BOOLEAN":
+		return arrow.FixedWidthTypes.Boolean
 	default:
 		return arrow.BinaryTypes.String
 	}
