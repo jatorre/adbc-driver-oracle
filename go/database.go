@@ -139,6 +139,10 @@ func (db *databaseImpl) getPool(ctx context.Context) (*sql.DB, error) {
 			return
 		}
 
+		// Allow parallel inserts — set pool size for concurrent batch operations
+		pool.SetMaxOpenConns(8)
+		pool.SetMaxIdleConns(8)
+
 		// Register SDO_GEOMETRY UDT so go-ora can decode geometry columns
 		if err := RegisterSDOTypes(pool); err != nil {
 			db.Logger.Warn("SDO_GEOMETRY UDT registration failed", "error", err)

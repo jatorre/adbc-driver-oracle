@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
@@ -287,12 +288,6 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 		strings.Join(placeholders, ", "),
 	)
 
-	stmt, err := s.cnxn.db.PrepareContext(ctx, insertSQL)
-	if err != nil {
-		return -1, s.ErrorHelper.Errorf(adbc.StatusIO, "prepare insert failed: %s", err)
-	}
-	defer stmt.Close()
-
 	s.ingestGeomCols = geomCols
 	var totalRows int64
 
@@ -300,7 +295,7 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 		// Process all batches from the stream
 		for s.bindStream.Next() {
 			rec := s.bindStream.Record()
-			n, err := s.insertBatch(ctx, stmt, rec)
+			n, err := s.insertBatchParallel(ctx, insertSQL, rec)
 			if err != nil {
 				return totalRows, err
 			}
@@ -310,7 +305,7 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 			return totalRows, s.ErrorHelper.Errorf(adbc.StatusIO, "bind stream error: %s", err)
 		}
 	} else if s.bindParams != nil {
-		n, err := s.insertBatch(ctx, stmt, s.bindParams)
+		n, err := s.insertBatchParallel(ctx, insertSQL, s.bindParams)
 		if err != nil {
 			return 0, err
 		}
@@ -318,6 +313,113 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 	}
 
 	return totalRows, nil
+}
+
+// insertBatchParallel splits a record batch into chunks and inserts them
+// in parallel across multiple database connections for higher throughput.
+func (s *statementImpl) insertBatchParallel(ctx context.Context, insertSQL string, rec arrow.RecordBatch) (int64, error) {
+	numRows := int(rec.NumRows())
+	if numRows == 0 {
+		return 0, nil
+	}
+
+	// Determine parallelism — default 1 worker (single big batch is fastest on small instances).
+	// Set ORACLE_INGEST_WORKERS=4 for larger Oracle instances with multiple OCPUs.
+	numWorkers := 1
+	if w := os.Getenv("ORACLE_INGEST_WORKERS"); w != "" {
+		fmt.Sscanf(w, "%d", &numWorkers)
+	}
+	chunkSize := (numRows + numWorkers - 1) / numWorkers
+	if chunkSize < 500 || numWorkers <= 1 {
+		// For small batches, just use single connection
+		return s.insertChunk(ctx, insertSQL, rec, 0, numRows)
+	}
+
+	type result struct {
+		rows int64
+		err  error
+	}
+
+	results := make(chan result, numWorkers)
+	for w := 0; w < numWorkers; w++ {
+		startRow := w * chunkSize
+		endRow := startRow + chunkSize
+		if endRow > numRows {
+			endRow = numRows
+		}
+		if startRow >= numRows {
+			break
+		}
+
+		go func(start, end int) {
+			n, err := s.insertChunk(ctx, insertSQL, rec, start, end)
+			results <- result{n, err}
+		}(startRow, endRow)
+	}
+
+	var totalRows int64
+	var firstErr error
+	activeWorkers := numWorkers
+	if numRows < chunkSize*numWorkers {
+		activeWorkers = (numRows + chunkSize - 1) / chunkSize
+	}
+	for i := 0; i < activeWorkers; i++ {
+		r := <-results
+		totalRows += r.rows
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+	}
+
+	if firstErr != nil {
+		return totalRows, firstErr
+	}
+	return totalRows, nil
+}
+
+// insertChunk inserts a slice of rows [startRow, endRow) from a record batch.
+// Uses a fresh connection from the pool to enable parallel inserts and avoid
+// Oracle ORA-00600 errors from long-running UDT sessions.
+func (s *statementImpl) insertChunk(ctx context.Context, insertSQL string, rec arrow.RecordBatch, startRow, endRow int) (int64, error) {
+	numRows := endRow - startRow
+	numCols := int(rec.NumCols())
+
+	// Each goroutine gets its own connection from the pool.
+	// This also works around Oracle ORA-00600 kopi2_readlen083 bugs
+	// that occur after inserting many SDO_GEOMETRY UDTs on a single session.
+	conn, err := s.cnxn.db.Conn(ctx)
+	if err != nil {
+		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "get connection failed: %s", err)
+	}
+	defer conn.Close()
+
+	stmt, err := conn.PrepareContext(ctx, insertSQL)
+	if err != nil {
+		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "prepare insert failed: %s", err)
+	}
+	defer stmt.Close()
+
+	// Build columnar arrays for the chunk
+	args := make([]interface{}, numCols)
+	for col := 0; col < numCols; col++ {
+		arr := rec.Column(col)
+		if srid, ok := s.ingestGeomCols[col]; ok {
+			args[col] = wkbColumnToSdoSliceRange(arr, startRow, endRow, srid)
+		} else {
+			args[col] = arrowColumnToSliceRange(arr, startRow, endRow)
+		}
+	}
+
+	_, err = stmt.ExecContext(ctx, args...)
+	if err != nil {
+		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "batch insert failed: %s", err)
+	}
+
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return int64(numRows), s.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
+	}
+
+	return int64(numRows), nil
 }
 
 func (s *statementImpl) insertBatch(ctx context.Context, stmt *sql.Stmt, rec arrow.RecordBatch) (int64, error) {
@@ -346,6 +448,106 @@ func (s *statementImpl) insertBatch(ctx context.Context, stmt *sql.Stmt, rec arr
 	}
 
 	return int64(numRows), nil
+}
+
+// arrowColumnToSliceRange extracts a range [start, end) from an Arrow column to a Go slice.
+func arrowColumnToSliceRange(arr arrow.Array, start, end int) interface{} {
+	numRows := end - start
+	switch a := arr.(type) {
+	case *array.Int64:
+		vals := make([]sql.NullInt64, numRows)
+		for i := start; i < end; i++ {
+			if a.IsNull(i) {
+				vals[i-start] = sql.NullInt64{}
+			} else {
+				vals[i-start] = sql.NullInt64{Int64: a.Value(i), Valid: true}
+			}
+		}
+		return vals
+	case *array.Int32:
+		vals := make([]sql.NullInt64, numRows)
+		for i := start; i < end; i++ {
+			if a.IsNull(i) {
+				vals[i-start] = sql.NullInt64{}
+			} else {
+				vals[i-start] = sql.NullInt64{Int64: int64(a.Value(i)), Valid: true}
+			}
+		}
+		return vals
+	case *array.Float64:
+		vals := make([]sql.NullFloat64, numRows)
+		for i := start; i < end; i++ {
+			if a.IsNull(i) {
+				vals[i-start] = sql.NullFloat64{}
+			} else {
+				vals[i-start] = sql.NullFloat64{Float64: a.Value(i), Valid: true}
+			}
+		}
+		return vals
+	case *array.String:
+		vals := make([]sql.NullString, numRows)
+		for i := start; i < end; i++ {
+			if a.IsNull(i) {
+				vals[i-start] = sql.NullString{}
+			} else {
+				vals[i-start] = sql.NullString{String: a.Value(i), Valid: true}
+			}
+		}
+		return vals
+	case *array.Binary:
+		vals := make([][]byte, numRows)
+		for i := start; i < end; i++ {
+			if !a.IsNull(i) {
+				vals[i-start] = a.Value(i)
+			}
+		}
+		return vals
+	case *array.Decimal128:
+		vals := make([]sql.NullString, numRows)
+		scale := a.DataType().(*arrow.Decimal128Type).Scale
+		for i := start; i < end; i++ {
+			if a.IsNull(i) {
+				vals[i-start] = sql.NullString{}
+			} else {
+				vals[i-start] = sql.NullString{String: a.Value(i).ToString(scale), Valid: true}
+			}
+		}
+		return vals
+	default:
+		vals := make([]sql.NullString, numRows)
+		for i := start; i < end; i++ {
+			if arr.IsNull(i) {
+				vals[i-start] = sql.NullString{}
+			} else {
+				vals[i-start] = sql.NullString{String: arr.ValueStr(i), Valid: true}
+			}
+		}
+		return vals
+	}
+}
+
+// wkbColumnToSdoSliceRange converts a range [start, end) of WKB binary values to SdoGeometry UDT objects.
+func wkbColumnToSdoSliceRange(arr arrow.Array, start, end int, srid int64) interface{} {
+	binArr, ok := arr.(*array.Binary)
+	if !ok {
+		return make([]*go_ora.Object, end-start)
+	}
+
+	vals := make([]*go_ora.Object, end-start)
+	for i := start; i < end; i++ {
+		if binArr.IsNull(i) {
+			vals[i-start] = nil
+			continue
+		}
+		wkb := binArr.Value(i)
+		geom, err := WKBToSdo(wkb, srid)
+		if err != nil {
+			vals[i-start] = nil
+			continue
+		}
+		vals[i-start] = go_ora.NewObject("MDSYS", "SDO_GEOMETRY", *geom)
+	}
+	return vals
 }
 
 // arrowColumnToSlice converts an Arrow array to a Go slice for go-ora batch insert.
