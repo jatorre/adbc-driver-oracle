@@ -1,35 +1,15 @@
-name: CI
+name: Release
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
-
-      - name: Unit tests
-        run: go test -v ./go/...
-
-      - name: Build driver package
-        run: go build ./go/
-
-      - name: Build CLI
-        run: go build -o oracle-adbc-test ./cmd/main.go
-
-      - name: Vet
-        run: go vet ./go/...
-
-  build-shared-library:
+  build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -82,20 +62,28 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
 
-  integration-test:
-    name: Integration tests
+  release:
+    name: Create Release
+    needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: test
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          go-version: '1.23'
+          path: artifacts
 
-      - name: Integration tests
-        if: env.ORACLE_TEST_DSN != ''
-        env:
-          ORACLE_TEST_DSN: ${{ secrets.ORACLE_TEST_DSN }}
-        run: go test -v -run TestIntegration ./go/...
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -type f \( -name '*.so' -o -name '*.dylib' \) -exec sha256sum {} \; | \
+            sed 's|  \./[^/]*/|  |' > ../checksums.txt
+          cat ../checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.so
+            artifacts/**/*.dylib
+            checksums.txt

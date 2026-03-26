@@ -31,6 +31,7 @@ const (
 	OptionPassword       = "oracle.password"
 	OptionWalletLocation = "oracle.wallet_location"
 	OptionWalletPassword = "oracle.wallet_password"
+	OptionWalletContent  = "oracle.wallet_content" // Inline ewallet.pem content (avoids temp file)
 	OptionDSN            = "oracle.dsn"
 
 	DefaultPort = "1521"

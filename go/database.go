@@ -15,15 +15,17 @@
 package oracle
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"sync"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
-	_ "github.com/sijms/go-ora/v2"
+	go_ora "github.com/sijms/go-ora/v2"
 )
 
 type databaseImpl struct {
@@ -36,6 +38,7 @@ type databaseImpl struct {
 	password       string
 	walletLocation string
 	walletPassword string
+	walletContent  string // Inline ewallet.pem content (avoids temp dir)
 	dsn            string
 
 	// Connection pool — shared across all Open() calls.
@@ -61,6 +64,8 @@ func (db *databaseImpl) SetOption(key string, val string) error {
 		db.walletLocation = val
 	case OptionWalletPassword:
 		db.walletPassword = val
+	case OptionWalletContent:
+		db.walletContent = val
 	case OptionDSN:
 		db.dsn = val
 	default:
@@ -126,11 +131,31 @@ func (db *databaseImpl) buildDSN() string {
 // getPool returns the shared connection pool, creating it on first call.
 func (db *databaseImpl) getPool(ctx context.Context) (*sql.DB, error) {
 	db.poolOnce.Do(func() {
-		dsn := db.buildDSN()
-		pool, err := sql.Open("oracle", dsn)
-		if err != nil {
-			db.poolErr = fmt.Errorf("failed to open Oracle connection pool: %w", err)
-			return
+		var pool *sql.DB
+		var err error
+
+		if db.walletContent != "" {
+			// Use Connector API for in-memory wallet (avoids temp files).
+			// Wallet content is base64-encoded cwallet.sso binary data.
+			walletBytes, decErr := base64.StdEncoding.DecodeString(db.walletContent)
+			if decErr != nil {
+				db.poolErr = fmt.Errorf("failed to decode wallet content (expected base64): %w", decErr)
+				return
+			}
+			dsn := db.buildDSN()
+			connector := go_ora.NewConnector(dsn).(*go_ora.OracleConnector)
+			if walletErr := connector.WithWallet(bytes.NewReader(walletBytes)); walletErr != nil {
+				db.poolErr = fmt.Errorf("failed to load wallet content: %w", walletErr)
+				return
+			}
+			pool = sql.OpenDB(connector)
+		} else {
+			dsn := db.buildDSN()
+			pool, err = sql.Open("oracle", dsn)
+			if err != nil {
+				db.poolErr = fmt.Errorf("failed to open Oracle connection pool: %w", err)
+				return
+			}
 		}
 
 		if err := pool.PingContext(ctx); err != nil {
