@@ -1,8 +1,10 @@
 *.dylib
 *.so
 *.dll
-*.h
 *.exe
 /build/
 /oracle-adbc-test
 trace.log
+
+# Ignore generated CGO header from c-shared build, but keep source headers
+libadbc_driver_oracle.h
