@@ -271,15 +271,21 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 	}
 
 	// Build INSERT statement.
-	// Geometry columns use direct SdoGeometry UDT insert (no server-side conversion).
+	// Geometry columns use SDO_UTIL.FROM_WKBGEOMETRY for server-side WKB conversion.
+	// This bypasses go-ora's UDT serialization which has known encoding issues
+	// with SDO_GEOMETRY (ORA-13031 Invalid Gtype, ORA-00600 kopi2_readlen083).
 	colNames := make([]string, schema.NumFields())
 	placeholders := make([]string, schema.NumFields())
 	geomCols := make(map[int]int64) // col index → srid
 	for i, f := range schema.Fields() {
 		colNames[i] = fmt.Sprintf(`"%s"`, strings.ToUpper(f.Name))
-		placeholders[i] = fmt.Sprintf(":%d", i+1)
 		if isGeometryColumn(f) {
-			geomCols[i] = extractSRIDFromField(f)
+			srid := extractSRIDFromField(f)
+			geomCols[i] = srid
+			// Use server-side WKB conversion with SRID
+			placeholders[i] = fmt.Sprintf("SDO_GEOMETRY(:%d, %d)", i+1, srid)
+		} else {
+			placeholders[i] = fmt.Sprintf(":%d", i+1)
 		}
 	}
 	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
@@ -399,12 +405,13 @@ func (s *statementImpl) insertChunk(ctx context.Context, insertSQL string, rec a
 	}
 	defer stmt.Close()
 
-	// Build columnar arrays for the chunk
+	// Build columnar arrays for the chunk.
+	// Geometry columns pass raw WKB bytes for server-side conversion via SDO_GEOMETRY(:N, srid).
 	args := make([]interface{}, numCols)
 	for col := 0; col < numCols; col++ {
 		arr := rec.Column(col)
-		if srid, ok := s.ingestGeomCols[col]; ok {
-			args[col] = wkbColumnToSdoSliceRange(arr, startRow, endRow, srid)
+		if _, ok := s.ingestGeomCols[col]; ok {
+			args[col] = wkbColumnToRawSliceRange(arr, startRow, endRow)
 		} else {
 			args[col] = arrowColumnToSliceRange(arr, startRow, endRow)
 		}
@@ -427,12 +434,12 @@ func (s *statementImpl) insertBatch(ctx context.Context, stmt *sql.Stmt, rec arr
 	numCols := int(rec.NumCols())
 
 	// Build columnar arrays for go-ora batch insert.
-	// Geometry columns are converted WKB→SdoGeometry and passed as go_ora.Object.
+	// Geometry columns pass raw WKB bytes for server-side conversion via SDO_GEOMETRY(:N, srid).
 	args := make([]interface{}, numCols)
 	for col := 0; col < numCols; col++ {
 		arr := rec.Column(col)
-		if srid, ok := s.ingestGeomCols[col]; ok {
-			args[col] = wkbColumnToSdoSlice(arr, numRows, srid)
+		if _, ok := s.ingestGeomCols[col]; ok {
+			args[col] = wkbColumnToRawSlice(arr, numRows)
 		} else {
 			args[col] = arrowColumnToSlice(arr, numRows)
 		}
@@ -524,6 +531,23 @@ func arrowColumnToSliceRange(arr arrow.Array, start, end int) interface{} {
 		}
 		return vals
 	}
+}
+
+// wkbColumnToRawSliceRange extracts raw WKB bytes from a range [start, end) of a binary column.
+// These bytes are passed to SDO_GEOMETRY(:N, srid) for server-side conversion.
+func wkbColumnToRawSliceRange(arr arrow.Array, start, end int) interface{} {
+	binArr, ok := arr.(*array.Binary)
+	if !ok {
+		return make([][]byte, end-start)
+	}
+
+	vals := make([][]byte, end-start)
+	for i := start; i < end; i++ {
+		if !binArr.IsNull(i) {
+			vals[i-start] = binArr.Value(i)
+		}
+	}
+	return vals
 }
 
 // wkbColumnToSdoSliceRange converts a range [start, end) of WKB binary values to SdoGeometry UDT objects.
@@ -636,6 +660,23 @@ func arrowColumnToSliceWithGeom(arr arrow.Array, numRows int, isGeom bool, srid 
 		}
 		return vals
 	}
+}
+
+// wkbColumnToRawSlice extracts raw WKB bytes from a binary column.
+// These bytes are passed to SDO_GEOMETRY(:N, srid) for server-side conversion.
+func wkbColumnToRawSlice(arr arrow.Array, numRows int) interface{} {
+	binArr, ok := arr.(*array.Binary)
+	if !ok {
+		return make([][]byte, numRows)
+	}
+
+	vals := make([][]byte, numRows)
+	for i := 0; i < numRows; i++ {
+		if !binArr.IsNull(i) {
+			vals[i] = binArr.Value(i)
+		}
+	}
+	return vals
 }
 
 // wkbColumnToSdoSlice converts a WKB binary column to a slice of go-ora Objects

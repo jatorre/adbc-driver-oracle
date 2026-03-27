@@ -99,6 +99,41 @@ func makePolygonWKB(lon, lat float64) []byte {
 	return buf
 }
 
+// makeMultiPolygonWKB creates a WKB MultiPolygon with two small squares.
+func makeMultiPolygonWKB() []byte {
+	d := 0.0001
+	// Two polygons at different locations
+	polys := [2][5][2]float64{
+		{{-73.935 - d, 40.730 - d}, {-73.935 + d, 40.730 - d}, {-73.935 + d, 40.730 + d}, {-73.935 - d, 40.730 + d}, {-73.935 - d, 40.730 - d}},
+		{{-73.940 - d, 40.735 - d}, {-73.940 + d, 40.735 - d}, {-73.940 + d, 40.735 + d}, {-73.940 - d, 40.735 + d}, {-73.940 - d, 40.735 - d}},
+	}
+	// MultiPolygon header: byte_order(1) + type(4) + numGeoms(4)
+	// Each polygon: byte_order(1) + type(4) + numRings(4) + numPoints(4) + 5*16 coords
+	polySize := 1 + 4 + 4 + 4 + 5*16
+	size := 1 + 4 + 4 + 2*polySize
+	buf := make([]byte, size)
+	buf[0] = 1 // little-endian
+	binary.LittleEndian.PutUint32(buf[1:5], 6) // wkbMultiPolygon
+	binary.LittleEndian.PutUint32(buf[5:9], 2) // 2 polygons
+	off := 9
+	for _, poly := range polys {
+		buf[off] = 1 // little-endian
+		off++
+		binary.LittleEndian.PutUint32(buf[off:off+4], 3) // wkbPolygon
+		off += 4
+		binary.LittleEndian.PutUint32(buf[off:off+4], 1) // 1 ring
+		off += 4
+		binary.LittleEndian.PutUint32(buf[off:off+4], 5) // 5 points
+		off += 4
+		for _, pt := range poly {
+			binary.LittleEndian.PutUint64(buf[off:off+8], math.Float64bits(pt[0]))
+			binary.LittleEndian.PutUint64(buf[off+8:off+16], math.Float64bits(pt[1]))
+			off += 16
+		}
+	}
+	return buf
+}
+
 // geomSchema returns an Arrow schema with id, name, and a geoarrow.wkb geometry column.
 func geomSchema() *arrow.Schema {
 	geomMD := arrow.MetadataFrom(map[string]string{
