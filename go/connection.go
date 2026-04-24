@@ -26,8 +26,9 @@ import (
 
 type connectionImpl struct {
 	driverbase.ConnectionImplBase
-	db     *sql.DB
-	ownsDB bool // if true, Close() closes the db; if false, pool is shared
+	db            *sql.DB
+	ownsDB        bool // if true, Close() closes the db; if false, pool is shared
+	ingestWorkers int  // parallel insert workers (from database config)
 }
 
 func (c *connectionImpl) NewStatement() (adbc.Statement, error) {

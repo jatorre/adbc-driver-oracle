@@ -5,6 +5,8 @@
 /build/
 /oracle-adbc-test
 trace.log
+.DS_Store
+.claude/
 
 # Ignore generated CGO header from c-shared build, but keep source headers
 libadbc_driver_oracle.h

@@ -13,7 +13,7 @@ require (
 // https://github.com/sijms/go-ora/pull/721
 // Fix: VARRAY encoding in nested UDT objects (null + large >252 bytes).
 // Without this fix, SDO_GEOMETRY insert crashes with ORA-00600 for polygons >~16 vertices.
-replace github.com/sijms/go-ora/v2 => github.com/jatorre/go-ora/v2 v2.8.25-0.20260317163939-3e9deaecd855
+replace github.com/sijms/go-ora/v2 => github.com/jatorre/go-ora/v2 v2.8.25-0.20260412035712-e6580e4a2907
 
 require (
 	github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20251215145213-df04bfe8de4f // indirect

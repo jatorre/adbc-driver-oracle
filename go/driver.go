@@ -33,6 +33,8 @@ const (
 	OptionWalletPassword = "oracle.wallet_password"
 	OptionWalletContent  = "oracle.wallet_content" // Inline ewallet.pem content (avoids temp file)
 	OptionDSN            = "oracle.dsn"
+	OptionPoolSize       = "oracle.pool_size"      // Max open connections (default: 8)
+	OptionIngestWorkers  = "oracle.ingest_workers" // Parallel insert workers (default: 1)
 
 	DefaultPort = "1521"
 )
@@ -82,6 +84,8 @@ func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string
 	db := &databaseImpl{
 		DatabaseImplBase: dbBase,
 		port:             DefaultPort,
+		poolSize:         8,
+		ingestWorkers:    1,
 	}
 
 	if err := db.SetOptions(opts); err != nil {

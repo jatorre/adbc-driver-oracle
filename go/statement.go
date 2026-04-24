@@ -282,8 +282,10 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 		if isGeometryColumn(f) {
 			srid := extractSRIDFromField(f)
 			geomCols[i] = srid
-			// Use server-side WKB conversion with SRID
-			placeholders[i] = fmt.Sprintf("SDO_GEOMETRY(:%d, %d)", i+1, srid)
+			// Direct UDT bind: WKB is converted client-side to SdoGeometry structs
+			// and sent via go-ora's Object encoding. This bypasses server-side
+			// SDO_GEOMETRY(TO_BLOB()) parsing for better throughput.
+			placeholders[i] = fmt.Sprintf(":%d", i+1)
 		} else {
 			placeholders[i] = fmt.Sprintf(":%d", i+1)
 		}
@@ -295,13 +297,49 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 	)
 
 	s.ingestGeomCols = geomCols
+
+	// Enable NOLOGGING on the table to reduce redo log overhead during bulk insert.
+	// Note: APPEND_VALUES hint is not compatible with go-ora's array binding protocol
+	// (Oracle interprets al8i4[1]>1 as batch execution, triggering ORA-38910).
+	// NOLOGGING alone still reduces redo I/O for conventional inserts.
+	s.cnxn.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s NOLOGGING", tableName))
+
 	var totalRows int64
 
 	if s.bindStream != nil {
-		// Process all batches from the stream
-		for s.bindStream.Next() {
-			rec := s.bindStream.Record()
-			n, err := s.insertBatchParallel(ctx, insertSQL, rec)
+		// Pipeline: prepare next batch while current one is inserting.
+		// This overlaps CPU-bound column conversion with network-bound Oracle insert.
+		type preparedBatch struct {
+			args []interface{}
+			nrow int
+		}
+
+		ahead := make(chan preparedBatch, 1)
+		go func() {
+			defer close(ahead)
+			for s.bindStream.Next() {
+				rec := s.bindStream.Record()
+				nrow := int(rec.NumRows())
+				if nrow == 0 {
+					continue
+				}
+				args := make([]interface{}, int(rec.NumCols()))
+				for col := 0; col < int(rec.NumCols()); col++ {
+					arr := rec.Column(col)
+					if srid, ok := s.ingestGeomCols[col]; ok {
+						// Convert WKB to SdoGeometry UDT objects client-side.
+						// This also copies the data, so Arrow buffer reuse is safe.
+						args[col] = wkbColumnToSdoSliceRange(arr, 0, nrow, srid)
+					} else {
+						args[col] = arrowColumnToSliceRange(arr, 0, nrow)
+					}
+				}
+				ahead <- preparedBatch{args: args, nrow: nrow}
+			}
+		}()
+
+		for batch := range ahead {
+			n, err := s.insertPreparedBatch(ctx, insertSQL, batch.args, batch.nrow)
 			if err != nil {
 				return totalRows, err
 			}
@@ -318,6 +356,9 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 		totalRows = n
 	}
 
+	// Restore logging after bulk ingest
+	s.cnxn.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s LOGGING", tableName))
+
 	return totalRows, nil
 }
 
@@ -330,8 +371,11 @@ func (s *statementImpl) insertBatchParallel(ctx context.Context, insertSQL strin
 	}
 
 	// Determine parallelism — default 1 worker (single big batch is fastest on small instances).
-	// Set ORACLE_INGEST_WORKERS=4 for larger Oracle instances with multiple OCPUs.
-	numWorkers := 1
+	// Configure via oracle.ingest_workers option or ORACLE_INGEST_WORKERS env var.
+	numWorkers := s.cnxn.ingestWorkers
+	if numWorkers <= 0 {
+		numWorkers = 1
+	}
 	if w := os.Getenv("ORACLE_INGEST_WORKERS"); w != "" {
 		fmt.Sscanf(w, "%d", &numWorkers)
 	}
@@ -406,16 +450,43 @@ func (s *statementImpl) insertChunk(ctx context.Context, insertSQL string, rec a
 	defer stmt.Close()
 
 	// Build columnar arrays for the chunk.
-	// Geometry columns pass raw WKB bytes for server-side conversion via SDO_GEOMETRY(:N, srid).
+	// Geometry columns are converted client-side from WKB to SdoGeometry UDT objects.
 	args := make([]interface{}, numCols)
 	for col := 0; col < numCols; col++ {
 		arr := rec.Column(col)
-		if _, ok := s.ingestGeomCols[col]; ok {
-			args[col] = wkbColumnToRawSliceRange(arr, startRow, endRow)
+		if srid, ok := s.ingestGeomCols[col]; ok {
+			args[col] = wkbColumnToSdoSliceRange(arr, startRow, endRow, srid)
 		} else {
 			args[col] = arrowColumnToSliceRange(arr, startRow, endRow)
 		}
 	}
+
+	_, err = stmt.ExecContext(ctx, args...)
+	if err != nil {
+		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "batch insert failed: %s", err)
+	}
+
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return int64(numRows), s.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
+	}
+
+	return int64(numRows), nil
+}
+
+// insertPreparedBatch inserts pre-converted column args into Oracle.
+// Used by the pipeline path where column conversion happens in a background goroutine.
+func (s *statementImpl) insertPreparedBatch(ctx context.Context, insertSQL string, args []interface{}, numRows int) (int64, error) {
+	conn, err := s.cnxn.db.Conn(ctx)
+	if err != nil {
+		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "get connection failed: %s", err)
+	}
+	defer conn.Close()
+
+	stmt, err := conn.PrepareContext(ctx, insertSQL)
+	if err != nil {
+		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "prepare insert failed: %s", err)
+	}
+	defer stmt.Close()
 
 	_, err = stmt.ExecContext(ctx, args...)
 	if err != nil {
@@ -545,6 +616,26 @@ func wkbColumnToRawSliceRange(arr arrow.Array, start, end int) interface{} {
 	for i := start; i < end; i++ {
 		if !binArr.IsNull(i) {
 			vals[i-start] = binArr.Value(i)
+		}
+	}
+	return vals
+}
+
+// wkbColumnToRawSliceCopy extracts raw WKB bytes with deep copies.
+// Used by the pipeline path where Arrow buffers may be freed before insert completes.
+func wkbColumnToRawSliceCopy(arr arrow.Array, start, end int) interface{} {
+	binArr, ok := arr.(*array.Binary)
+	if !ok {
+		return make([][]byte, end-start)
+	}
+
+	vals := make([][]byte, end-start)
+	for i := start; i < end; i++ {
+		if !binArr.IsNull(i) {
+			src := binArr.Value(i)
+			dst := make([]byte, len(src))
+			copy(dst, src)
+			vals[i-start] = dst
 		}
 	}
 	return vals
@@ -783,7 +874,7 @@ func buildCreateTableDDL(tableName string, schema *arrow.Schema) string {
 		}
 		cols = append(cols, fmt.Sprintf(`"%s" %s%s`, strings.ToUpper(f.Name), oraType, nullable))
 	}
-	return fmt.Sprintf("CREATE TABLE %s (%s)", tableName, strings.Join(cols, ", "))
+	return fmt.Sprintf("CREATE TABLE %s (%s) NOLOGGING", tableName, strings.Join(cols, ", "))
 }
 
 func arrowToOracleType(dt arrow.DataType) string {
@@ -859,13 +950,13 @@ func (s *statementImpl) closePrepared() {
 // =============================================================================
 
 type oracleRecordReader struct {
-	rows     *sql.Rows
-	colTypes []*sql.ColumnType
-	scanDest []interface{}
-	scanVals []interface{}
+	rows        *sql.Rows
+	colTypes    []*sql.ColumnType
+	scanDest    []interface{}
+	scanVals    []interface{}
 	geomIndices []int
-	firstRow     []interface{}
-	hasFirstRow  bool
+	firstRow    []interface{}
+	hasFirstRow bool
 }
 
 func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.RecordBatch, rowIdx int) (*arrow.Schema, error) {

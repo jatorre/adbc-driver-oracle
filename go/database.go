@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/url"
+	"strconv"
 	"sync"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
@@ -40,6 +41,10 @@ type databaseImpl struct {
 	walletPassword string
 	walletContent  string // Inline ewallet.pem content (avoids temp dir)
 	dsn            string
+
+	// Performance tuning
+	poolSize      int // Max open connections (default: 8)
+	ingestWorkers int // Parallel insert workers (default: 1)
 
 	// Connection pool — shared across all Open() calls.
 	// sql.DB is already a pool internally; we create it once and reuse.
@@ -68,6 +73,14 @@ func (db *databaseImpl) SetOption(key string, val string) error {
 		db.walletContent = val
 	case OptionDSN:
 		db.dsn = val
+	case OptionPoolSize:
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			db.poolSize = n
+		}
+	case OptionIngestWorkers:
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			db.ingestWorkers = n
+		}
 	default:
 		return db.DatabaseImplBase.SetOption(key, val)
 	}
@@ -165,8 +178,12 @@ func (db *databaseImpl) getPool(ctx context.Context) (*sql.DB, error) {
 		}
 
 		// Allow parallel inserts — set pool size for concurrent batch operations
-		pool.SetMaxOpenConns(8)
-		pool.SetMaxIdleConns(8)
+		poolSize := db.poolSize
+		if poolSize <= 0 {
+			poolSize = 8
+		}
+		pool.SetMaxOpenConns(poolSize)
+		pool.SetMaxIdleConns(poolSize)
 
 		// Register SDO_GEOMETRY UDT so go-ora can decode geometry columns
 		if err := RegisterSDOTypes(pool); err != nil {
@@ -189,6 +206,7 @@ func (db *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		ConnectionImplBase: cnxnBase,
 		db:                 pool,
 		ownsDB:             false, // pool is owned by the database, not the connection
+		ingestWorkers:      db.ingestWorkers,
 	}
 
 	return driverbase.NewConnectionBuilder(cnxn).
