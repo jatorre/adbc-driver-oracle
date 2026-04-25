@@ -17,9 +17,11 @@ package oracle
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
@@ -563,20 +565,28 @@ func arrowColumnToSliceRange(arr arrow.Array, start, end int) interface{} {
 		}
 		return vals
 	case *array.String:
+		// Deep-copy: a.Value(i) aliases the Arrow buffer, which is released
+		// when the next stream record arrives. Holding the alias past that
+		// point produces use-after-free corruption (manifests as garbled
+		// VARCHAR2 columns through Oracle's bulk array bind).
 		vals := make([]sql.NullString, numRows)
 		for i := start; i < end; i++ {
 			if a.IsNull(i) {
 				vals[i-start] = sql.NullString{}
 			} else {
-				vals[i-start] = sql.NullString{String: a.Value(i), Valid: true}
+				vals[i-start] = sql.NullString{String: strings.Clone(a.Value(i)), Valid: true}
 			}
 		}
 		return vals
 	case *array.Binary:
+		// Deep-copy for the same reason as *array.String above.
 		vals := make([][]byte, numRows)
 		for i := start; i < end; i++ {
 			if !a.IsNull(i) {
-				vals[i-start] = a.Value(i)
+				src := a.Value(i)
+				dst := make([]byte, len(src))
+				copy(dst, src)
+				vals[i-start] = dst
 			}
 		}
 		return vals
@@ -711,12 +721,15 @@ func arrowColumnToSliceWithGeom(arr arrow.Array, numRows int, isGeom bool, srid 
 		}
 		return vals
 	case *array.String:
+		// See note on the deep copy in arrowColumnToSliceRange — Arrow
+		// String.Value aliases the underlying buffer, which can be freed
+		// before Oracle's array bind reads the value.
 		vals := make([]sql.NullString, numRows)
 		for i := 0; i < numRows; i++ {
 			if a.IsNull(i) {
 				vals[i] = sql.NullString{}
 			} else {
-				vals[i] = sql.NullString{String: a.Value(i), Valid: true}
+				vals[i] = sql.NullString{String: strings.Clone(a.Value(i)), Valid: true}
 			}
 		}
 		return vals
@@ -724,7 +737,10 @@ func arrowColumnToSliceWithGeom(arr arrow.Array, numRows int, isGeom bool, srid 
 		vals := make([][]byte, numRows)
 		for i := 0; i < numRows; i++ {
 			if !a.IsNull(i) {
-				vals[i] = a.Value(i)
+				src := a.Value(i)
+				dst := make([]byte, len(src))
+				copy(dst, src)
+				vals[i] = dst
 			}
 		}
 		return vals
@@ -841,22 +857,51 @@ func isGeometryColumn(f arrow.Field) bool {
 }
 
 // extractSRIDFromField extracts the SRID from geoarrow extension metadata.
+//
+// DuckDB exposes CRS metadata as the compact GeoArrow form
+//
+//	{"crs":"EPSG:3857"}
+//
+// while other producers send PROJJSON
+//
+//	{"crs":{"id":{"authority":"EPSG","code":3857}}}
+//
+// Both are accepted. Returns 4326 when no usable SRID is found so that
+// callers always have a concrete value to bind into SDO_GEOMETRY.
 func extractSRIDFromField(f arrow.Field) int64 {
 	meta, ok := f.Metadata.GetValue("ARROW:extension:metadata")
-	if !ok || meta == "{}" {
-		return 4326 // default
-	}
-	// Simple extraction — look for "code":NNNN
-	idx := strings.Index(meta, `"code":`)
-	if idx < 0 {
+	if !ok || meta == "" || meta == "{}" {
 		return 4326
 	}
-	var srid int64
-	fmt.Sscanf(meta[idx+7:], "%d", &srid)
-	if srid == 0 {
+	var holder struct {
+		CRS json.RawMessage `json:"crs"`
+	}
+	if err := json.Unmarshal([]byte(meta), &holder); err != nil || len(holder.CRS) == 0 || string(holder.CRS) == "null" {
 		return 4326
 	}
-	return srid
+	// Compact GeoArrow CRS: a JSON string like "EPSG:3857".
+	var crsStr string
+	if err := json.Unmarshal(holder.CRS, &crsStr); err == nil {
+		if strings.HasPrefix(strings.ToUpper(crsStr), "EPSG:") {
+			if code, err := strconv.ParseInt(crsStr[5:], 10, 64); err == nil && code != 0 {
+				return code
+			}
+		}
+		return 4326
+	}
+	// PROJJSON: {"id":{"authority":"EPSG","code":N}}.
+	var crs struct {
+		ID struct {
+			Authority string `json:"authority"`
+			Code      int64  `json:"code"`
+		} `json:"id"`
+	}
+	if err := json.Unmarshal(holder.CRS, &crs); err == nil {
+		if strings.EqualFold(crs.ID.Authority, "EPSG") && crs.ID.Code != 0 {
+			return crs.ID.Code
+		}
+	}
+	return 4326
 }
 
 func buildCreateTableDDL(tableName string, schema *arrow.Schema) string {
@@ -969,9 +1014,12 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 	fields := make([]arrow.Field, len(colTypes))
 	r.geomIndices = nil
 
-	// Detect geometry columns
+	// Detect geometry columns. go-ora reports SDO_GEOMETRY natively for the
+	// MDSYS UDT registered in databaseImpl.getPool; XMLTYPE is also accepted
+	// for the SDO_UTIL.TO_GMLGEOMETRY-style server-side conversion path.
 	for i, ct := range colTypes {
-		if strings.ToUpper(ct.DatabaseTypeName()) == "XMLTYPE" {
+		dbType := strings.ToUpper(ct.DatabaseTypeName())
+		if dbType == "SDO_GEOMETRY" || dbType == "MDSYS.SDO_GEOMETRY" || dbType == "XMLTYPE" {
 			r.geomIndices = append(r.geomIndices, i)
 		}
 	}
@@ -983,11 +1031,14 @@ func (r *oracleRecordReader) NextResultSet(ctx context.Context, rec arrow.Record
 	}
 
 	// Build schema
+	geomCols := make(map[int]struct{}, len(r.geomIndices))
+	for _, idx := range r.geomIndices {
+		geomCols[idx] = struct{}{}
+	}
 	for i, ct := range colTypes {
 		nullable, _ := ct.Nullable()
-		dbType := strings.ToUpper(ct.DatabaseTypeName())
 
-		if dbType == "XMLTYPE" {
+		if _, ok := geomCols[i]; ok {
 			fields[i] = GeoArrowWKBField(ct.Name(), srid, nullable)
 		} else {
 			fields[i] = arrow.Field{

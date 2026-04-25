@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
@@ -115,29 +116,49 @@ func (db *databaseImpl) GetOption(key string) (string, error) {
 
 func (db *databaseImpl) buildDSN() string {
 	if db.dsn != "" {
+		// If the user passed something that isn't a URL — typically a TNS
+		// alias from an Autonomous Database wallet — try to resolve it
+		// against tnsnames.ora in walletLocation. This lets users paste in
+		// the same alias they'd use with sqlplus / sqlcl.
+		if !strings.Contains(db.dsn, "://") && db.walletLocation != "" {
+			if aliases, err := loadTNSAliases(db.walletLocation); err == nil {
+				if entry, ok := aliases[strings.ToLower(db.dsn)]; ok {
+					return assembleOracleURL(db.user, db.password, entry.Host, entry.Port, entry.Service, db.walletLocation, db.walletPassword)
+				}
+			}
+		}
 		return db.dsn
 	}
 
-	dsn := fmt.Sprintf("oracle://%s:%s@%s:%s/%s",
-		url.PathEscape(db.user),
-		url.PathEscape(db.password),
-		db.hostname,
-		db.port,
-		db.serviceName,
-	)
+	return assembleOracleURL(db.user, db.password, db.hostname, db.port, db.serviceName, db.walletLocation, db.walletPassword)
+}
 
+// assembleOracleURL builds the oracle://user:pass@host:port/service URL with
+// the same query-parameter conventions used historically by buildDSN.
+func assembleOracleURL(user, password, host, port, service, walletLocation, walletPassword string) string {
+	dsn := fmt.Sprintf("oracle://%s:%s@%s:%s/%s",
+		url.PathEscape(user),
+		url.PathEscape(password),
+		host,
+		port,
+		service,
+	)
 	params := url.Values{}
 	params.Set("PREFETCH_ROWS", "10000")
-	if db.walletLocation != "" {
-		params.Set("WALLET", db.walletLocation)
+	if walletLocation != "" {
+		// Wallet implies TCPS for Autonomous Database; switch SSL on.
+		// SSL VERIFY=false matches the wallet's mTLS chain rather than the
+		// hostname, which is what ATP wallets are designed for.
+		params.Set("WALLET", walletLocation)
+		params.Set("SSL", "enable")
+		params.Set("SSL VERIFY", "false")
 	}
-	if db.walletPassword != "" {
-		params.Set("WALLET PASSWORD", db.walletPassword)
+	if walletPassword != "" {
+		params.Set("WALLET PASSWORD", walletPassword)
 	}
 	if len(params) > 0 {
 		dsn += "?" + params.Encode()
 	}
-
 	return dsn
 }
 

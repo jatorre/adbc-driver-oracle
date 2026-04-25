@@ -39,17 +39,16 @@ func GeoArrowWKBField(name string, srid int64, nullable bool) arrow.Field {
 	}
 }
 
-// buildGeoArrowMetadata builds the PROJJSON CRS metadata for a given SRID.
+// buildGeoArrowMetadata builds the GeoArrow column-level CRS metadata for a
+// given SRID. The compact `{"crs":"EPSG:N"}` form is what DuckDB produces and
+// what the GeoArrow spec accepts as the column-level extension metadata.
+// Returns an empty JSON object when SRID is unknown so the column is still
+// tagged as geoarrow.wkb but without a CRS claim.
 func buildGeoArrowMetadata(srid int64) string {
 	if srid == 0 {
 		return "{}"
 	}
-
-	// Minimal PROJJSON with EPSG authority
-	return fmt.Sprintf(
-		`{"columns":{"geometry":{"encoding":"wkb","crs":{"id":{"authority":"EPSG","code":%d}}}}}`,
-		srid,
-	)
+	return fmt.Sprintf(`{"crs":"EPSG:%d"}`, srid)
 }
 
 // UpdateSchemaWithGeoArrow replaces a Binary field with a geoarrow.wkb-annotated field.
