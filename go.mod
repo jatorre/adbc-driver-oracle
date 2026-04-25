@@ -11,9 +11,16 @@ require (
 
 // TODO: Remove this replace once go-ora PR #721 is merged upstream.
 // https://github.com/sijms/go-ora/pull/721
-// Fix: VARRAY encoding in nested UDT objects (null + large >252 bytes).
-// Without this fix, SDO_GEOMETRY insert crashes with ORA-00600 for polygons >~16 vertices.
-replace github.com/sijms/go-ora/v2 => github.com/jatorre/go-ora/v2 v2.8.25-0.20260412035712-e6580e4a2907
+// Fixes:
+//   - VARRAY encoding in nested UDT objects (null + large >252 bytes).
+//     Without this fix, SDO_GEOMETRY insert crashes with ORA-00600 for polygons >~16 vertices.
+//   - NULL UDT array bind: per-row envelope drops the trailing zero so
+//     bulk INSERTs of SDO_GEOMETRY with mixed-NULL rows don't fail with
+//     ORA-03146 "invalid buffer length for TTC field".
+//   - NULL UDT result-set decode: removes the bogus extra 0x81 0x01
+//     trailer read so SELECTs that include NULL SDO_GEOMETRY rows don't
+//     desync the stream and crash later rows with "invalid size for GetInt64".
+replace github.com/sijms/go-ora/v2 => github.com/jatorre/go-ora/v2 v2.8.25-0.20260425184954-cc44340b0974
 
 require (
 	github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20251215145213-df04bfe8de4f // indirect
