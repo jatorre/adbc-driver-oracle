@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -145,7 +146,11 @@ func (s *statementImpl) ExecuteQuery(ctx context.Context) (array.RecordReader, i
 	}
 
 	var rr driverbase.BaseRecordReader
-	if err := rr.Init(ctx, s.alloc, nil, driverbase.BaseRecordReaderOptions{}, impl); err != nil {
+	// driverbase-go v0.0.0-20260409+ added a *slog.Logger as the 3rd
+	// argument to BaseRecordReader.Init (previously just (ctx, alloc,
+	// params, options, impl)). Pass slog.Default() — driverbase rejects
+	// a nil logger.
+	if err := rr.Init(ctx, s.alloc, slog.Default(), nil, driverbase.BaseRecordReaderOptions{}, impl); err != nil {
 		rows.Close()
 		return nil, -1, err
 	}
@@ -1062,7 +1067,10 @@ func (r *oracleRecordReader) BeginAppending(builder *array.RecordBuilder) error 
 	return nil
 }
 
-func (r *oracleRecordReader) AppendRow(builder *array.RecordBuilder) (int64, error) {
+// AppendRows appends one row per call. The new driverbase API (since
+// 20260409) batches multiple rows per call to amortize builder overhead;
+// we keep the per-row semantics by returning rowCount=1 each call.
+func (r *oracleRecordReader) AppendRows(builder *array.RecordBuilder) (int64, int64, error) {
 	// Replay peeked first row if available
 	if r.hasFirstRow {
 		r.hasFirstRow = false
@@ -1071,13 +1079,13 @@ func (r *oracleRecordReader) AppendRow(builder *array.RecordBuilder) (int64, err
 	} else {
 		if !r.rows.Next() {
 			if err := r.rows.Err(); err != nil {
-				return 0, err
+				return 0, 0, err
 			}
-			return 0, io.EOF
+			return 0, 0, io.EOF
 		}
 
 		if err := r.rows.Scan(r.scanDest...); err != nil {
-			return 0, fmt.Errorf("scan error: %w", err)
+			return 0, 0, fmt.Errorf("scan error: %w", err)
 		}
 	}
 
@@ -1097,7 +1105,7 @@ func (r *oracleRecordReader) AppendRow(builder *array.RecordBuilder) (int64, err
 		}
 	}
 
-	return rowSize, nil
+	return 1, rowSize, nil
 }
 
 func (r *oracleRecordReader) appendGeometry(fieldBuilder array.Builder, val interface{}) int64 {
