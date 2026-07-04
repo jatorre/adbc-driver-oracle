@@ -69,7 +69,7 @@ func buildScalarTestData(alloc memory.Allocator, numRows int) arrow.RecordBatch 
 // makePointWKB creates a WKB Point (21 bytes) from lon/lat.
 func makePointWKB(lon, lat float64) []byte {
 	buf := make([]byte, 21)
-	buf[0] = 1 // little-endian
+	buf[0] = 1                                 // little-endian
 	binary.LittleEndian.PutUint32(buf[1:5], 1) // wkbPoint
 	binary.LittleEndian.PutUint64(buf[5:13], math.Float64bits(lon))
 	binary.LittleEndian.PutUint64(buf[13:21], math.Float64bits(lat))
@@ -112,7 +112,7 @@ func makeMultiPolygonWKB() []byte {
 	polySize := 1 + 4 + 4 + 4 + 5*16
 	size := 1 + 4 + 4 + 2*polySize
 	buf := make([]byte, size)
-	buf[0] = 1 // little-endian
+	buf[0] = 1                                 // little-endian
 	binary.LittleEndian.PutUint32(buf[1:5], 6) // wkbMultiPolygon
 	binary.LittleEndian.PutUint32(buf[5:9], 2) // 2 polygons
 	off := 9
@@ -204,7 +204,7 @@ func (s *geomRecordStream) Next() bool {
 	s.nextID += bs
 	return true
 }
-func (s *geomRecordStream) Record() arrow.Record          { return s.current }
+func (s *geomRecordStream) Record() arrow.Record           { return s.current }
 func (s *geomRecordStream) RecordBatch() arrow.RecordBatch { return s.current }
 func (s *geomRecordStream) Err() error                     { return nil }
 func (s *geomRecordStream) Retain()                        { s.refCount++ }
@@ -314,7 +314,7 @@ func (s *parquetBuildingStream) Next() bool {
 	s.emitted += int64(s.current.NumRows())
 	return true
 }
-func (s *parquetBuildingStream) Record() arrow.Record          { return s.current }
+func (s *parquetBuildingStream) Record() arrow.Record           { return s.current }
 func (s *parquetBuildingStream) RecordBatch() arrow.RecordBatch { return s.current }
 func (s *parquetBuildingStream) Err() error                     { return s.rr.Err() }
 func (s *parquetBuildingStream) Retain()                        { s.refCount++ }

@@ -72,3 +72,32 @@ func TestWKBRoundTrip_MultiPolygon(t *testing.T) {
 		t.Errorf("Ordinates: want 20, got %d", len(parsed.Ordinates))
 	}
 }
+
+// Corrupt WKB with a wire-controlled point count far beyond the actual data
+// must return an error, not panic or allocate gigabytes (the conversion runs
+// in the ingest pipeline goroutine, where a panic kills the whole process).
+func TestWKBToSdo_TruncatedData(t *testing.T) {
+	cases := map[string][]byte{
+		"linestring claims 1M points": {
+			1, 2, 0, 0, 0, // little-endian, LineString
+			0, 0, 16, 0, // numPoints = 1048576
+			0, 0, 0, 0, 0, 0, 0, 0, // just one ordinate
+		},
+		"polygon ring claims huge count": {
+			1, 3, 0, 0, 0, // Polygon
+			1, 0, 0, 0, // one ring
+			255, 255, 255, 255, // numPoints = 4294967295
+		},
+		"multilinestring truncated": {
+			1, 5, 0, 0, 0, // MultiLineString
+			1, 0, 0, 0, // one sub-geometry
+			1, 2, 0, 0, 0, // sub: LineString
+			100, 0, 0, 0, // 100 points, no data
+		},
+	}
+	for name, wkb := range cases {
+		if _, err := WKBToSdo(wkb, 4326); err == nil {
+			t.Errorf("%s: expected error, got nil", name)
+		}
+	}
+}

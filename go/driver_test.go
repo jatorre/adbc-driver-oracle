@@ -202,8 +202,9 @@ func TestIntegration_TypeMapping(t *testing.T) {
 		t.Fatalf("expected 6 fields, got %d", schema.NumFields())
 	}
 
-	// Verify types
-	expected := []string{"float64", "float64", "utf8", "timestamp[us, tz=UTC]", "timestamp[us, tz=UTC]", "binary"}
+	// Verify types. DATE and TIMESTAMP carry no zone in Oracle, so they map to
+	// tz-naive Arrow timestamps (wall clock); SYSTIMESTAMP is TSTZ → tz=UTC.
+	expected := []string{"float64", "float64", "utf8", "timestamp[us]", "timestamp[us, tz=UTC]", "binary"}
 	for i, f := range schema.Fields() {
 		got := f.Type.String()
 		if got != expected[i] {
@@ -531,7 +532,7 @@ func TestIntegration_BulkIngest(t *testing.T) {
 }
 
 // TestIntegration_GeometryInsertValidate inserts various geometry types via ADBC
-// ingest and validates them on the Oracle side using SDO_UTIL.VALIDATE_GEOMETRY_WITH_CONTEXT
+// ingest and validates them on the Oracle side using SDO_GEOM.VALIDATE_GEOMETRY_WITH_CONTEXT
 // and direct GTYPE/coordinate checks. This catches encoding issues in go-ora's
 // UDT serialization that pure Go-side tests cannot detect.
 func TestIntegration_GeometryInsertValidate(t *testing.T) {
@@ -840,7 +841,7 @@ func TestIntegration_GoOraUDTDirect(t *testing.T) {
 		id, label,
 		t.geom.SDO_GTYPE,
 		t.geom.SDO_SRID,
-		SDO_UTIL.VALIDATE_GEOMETRY_WITH_CONTEXT(t.geom, 0.005)
+		SDO_GEOM.VALIDATE_GEOMETRY_WITH_CONTEXT(t.geom, 0.005)
 	FROM %s t ORDER BY id`, tableName))
 	if err != nil {
 		t.Fatalf("SELECT: %v", err)
@@ -903,7 +904,7 @@ func TestIntegration_GoOraUDTDirect(t *testing.T) {
 
 	// Compare: validate control geometries too (should all be TRUE)
 	ctrlRows, err := db.Query(fmt.Sprintf(`SELECT id, label,
-		SDO_UTIL.VALIDATE_GEOMETRY_WITH_CONTEXT(t.geom, 0.005)
+		SDO_GEOM.VALIDATE_GEOMETRY_WITH_CONTEXT(t.geom, 0.005)
 	FROM %s t ORDER BY id`, controlTable))
 	if err != nil {
 		t.Fatalf("control SELECT: %v", err)
@@ -958,7 +959,7 @@ func TestIntegration_WKBViaSDOConstructor(t *testing.T) {
 		t.Logf("SDO_GEOMETRY(wkb,srid) INSERT id=%d: OK", tc.id)
 	}
 
-	// Validate — SDO_UTIL.VALIDATE_GEOMETRY_WITH_CONTEXT is not available on all
+	// Validate — SDO_GEOM.VALIDATE_GEOMETRY_WITH_CONTEXT is not available on all
 	// Oracle editions (e.g. ADB free tier), so we just check GTYPE and SRID.
 	rows, err := db.Query(fmt.Sprintf(`SELECT id,
 		t.geom.SDO_GTYPE,
