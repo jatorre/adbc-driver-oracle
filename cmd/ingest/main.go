@@ -40,6 +40,8 @@ func main() {
 	filePath := flag.String("file", "", "Parquet file to ingest")
 	mode := flag.String("mode", "create", "Ingest mode: create, append, replace, create_append")
 	batchSize := flag.Int("batch", 10000, "Rows per batch")
+	stringType := flag.String("string-type", "", "String column DDL sizing: auto, varchar2, clob")
+	clobColumns := flag.String("clob-columns", "", "Comma-separated column names forced to CLOB")
 	flag.Parse()
 
 	if *dsn == "" || *tableName == "" || *filePath == "" {
@@ -132,6 +134,18 @@ func main() {
 		if gs, ok := stmt.(adbc.GetSetOptions); ok {
 			gs.SetOption(adbc.OptionKeyIngestTargetTable, *tableName)
 			gs.SetOption(adbc.OptionKeyIngestMode, currentMode)
+			if *stringType != "" {
+				if err := gs.SetOption(oracle.OptionIngestStringType, *stringType); err != nil {
+					fmt.Fprintf(os.Stderr, "invalid -string-type: %v\n", err)
+					os.Exit(1)
+				}
+			}
+			if *clobColumns != "" {
+				if err := gs.SetOption(oracle.OptionIngestClobColumns, *clobColumns); err != nil {
+					fmt.Fprintf(os.Stderr, "invalid -clob-columns: %v\n", err)
+					os.Exit(1)
+				}
+			}
 		}
 
 		if err := stmt.Bind(ctx, rec); err != nil {

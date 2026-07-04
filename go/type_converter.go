@@ -128,18 +128,36 @@ func appendString(b *array.StringBuilder, val interface{}) int64 {
 }
 
 func appendTimestamp(b *array.TimestampBuilder, val interface{}) int64 {
+	tsType := b.Type().(*arrow.TimestampType)
+	appendTime := func(t time.Time) {
+		if tsType.TimeZone == "" {
+			// Tz-naive column: store the wall clock. go-ora returns tz-less
+			// DATE/TIMESTAMP values as wall-clock time.Time relocated into the
+			// DB server's zone (UTC only when the server runs UTC), so an
+			// epoch-based conversion would shift the value by the server's
+			// offset. Rebuild the fields as UTC instead.
+			t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)
+		}
+		ts, err := arrow.TimestampFromTime(t, tsType.Unit)
+		if err != nil {
+			b.AppendNull()
+			return
+		}
+		b.Append(ts)
+	}
 	switch v := val.(type) {
 	case time.Time:
-		b.Append(arrow.Timestamp(v.UnixMicro()))
+		appendTime(v)
 	case string:
 		// Try common Oracle timestamp formats
 		for _, layout := range []string{
-			"2006-01-02T15:04:05Z07:00",
-			"2006-01-02 15:04:05",
+			"2006-01-02T15:04:05.999999999Z07:00",
+			"2006-01-02 15:04:05.999999999 Z07:00",
+			"2006-01-02 15:04:05.999999999",
 			"2006-01-02",
 		} {
 			if t, err := time.Parse(layout, v); err == nil {
-				b.Append(arrow.Timestamp(t.UnixMicro()))
+				appendTime(t)
 				return 8
 			}
 		}
@@ -176,4 +194,3 @@ func appendBoolean(b *array.BooleanBuilder, val interface{}) int64 {
 	}
 	return 1
 }
-

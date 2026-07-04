@@ -18,12 +18,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
@@ -31,6 +34,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	go_ora "github.com/sijms/go-ora/v2"
+	"github.com/sijms/go-ora/v2/network"
 )
 
 type statementImpl struct {
@@ -51,6 +55,12 @@ type statementImpl struct {
 	ingestTargetTable string
 	ingestMode        string
 	ingestGeomCols    map[int]int64 // col index → srid for geometry columns
+
+	// String-column DDL sizing (see resolveColumnTypes)
+	ingestStringType    string          // "auto" (default), "varchar2", "clob"
+	ingestClobColumns   map[string]bool // uppercased column names forced to CLOB
+	ingestScanLimitByte int64           // max bytes buffered for the auto type scan (0 = scan disabled)
+	ingestScanLimitSet  bool            // distinguishes "unset, use default" from an explicit 0
 }
 
 func (s *statementImpl) Base() *driverbase.StatementImplBase {
@@ -71,6 +81,32 @@ func (s *statementImpl) SetOption(key, value string) error {
 	case adbc.OptionKeyIngestMode:
 		s.ingestMode = value
 		return nil
+	case OptionIngestStringType:
+		v := strings.ToLower(strings.TrimSpace(value))
+		switch v {
+		case "", "auto", "varchar2", "clob":
+			s.ingestStringType = v
+			return nil
+		}
+		return s.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+			"%s must be one of auto, varchar2, clob (got %q)", OptionIngestStringType, value)
+	case OptionIngestClobColumns:
+		s.ingestClobColumns = make(map[string]bool)
+		for _, name := range strings.Split(value, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				s.ingestClobColumns[strings.ToUpper(name)] = true
+			}
+		}
+		return nil
+	case OptionIngestTypeScanLimit:
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || n < 0 {
+			return s.ErrorHelper.Errorf(adbc.StatusInvalidArgument,
+				"%s must be a non-negative integer (got %q; 0 disables the scan)", OptionIngestTypeScanLimit, value)
+		}
+		s.ingestScanLimitByte = n
+		s.ingestScanLimitSet = true
+		return nil
 	default:
 		return s.StatementImplBase.SetOption(key, value)
 	}
@@ -82,6 +118,23 @@ func (s *statementImpl) GetOption(key string) (string, error) {
 		return s.ingestTargetTable, nil
 	case adbc.OptionKeyIngestMode:
 		return s.ingestMode, nil
+	case OptionIngestStringType:
+		if s.ingestStringType == "" {
+			return "auto", nil
+		}
+		return s.ingestStringType, nil
+	case OptionIngestClobColumns:
+		cols := make([]string, 0, len(s.ingestClobColumns))
+		for name := range s.ingestClobColumns {
+			cols = append(cols, name)
+		}
+		sort.Strings(cols)
+		return strings.Join(cols, ","), nil
+	case OptionIngestTypeScanLimit:
+		if !s.ingestScanLimitSet {
+			return strconv.FormatInt(defaultTypeScanLimitBytes, 10), nil
+		}
+		return strconv.FormatInt(s.ingestScanLimitByte, 10), nil
 	default:
 		return s.StatementImplBase.GetOption(key)
 	}
@@ -167,24 +220,43 @@ func (s *statementImpl) ExecuteUpdate(ctx context.Context) (int64, error) {
 		return -1, s.ErrorHelper.Errorf(adbc.StatusInvalidState, "no query set")
 	}
 
-	args := s.extractBindArgs(0)
+	exec := func(args []interface{}) (int64, error) {
+		var result sql.Result
+		var err error
+		if s.prepared != nil {
+			result, err = s.prepared.ExecContext(ctx, args...)
+		} else {
+			result, err = s.cnxn.db.ExecContext(ctx, s.query, args...)
+		}
+		if err != nil {
+			return -1, s.ErrorHelper.Errorf(adbc.StatusIO, "execute failed: %s", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return -1, s.ErrorHelper.Errorf(adbc.StatusIO, "failed to get rows affected: %s", err)
+		}
+		return affected, nil
+	}
 
-	var result sql.Result
-	var err error
-	if s.prepared != nil {
-		result, err = s.prepared.ExecContext(ctx, args...)
-	} else {
-		result, err = s.cnxn.db.ExecContext(ctx, s.query, args...)
+	// No parameters bound: execute once.
+	if s.bindParams == nil || s.bindParams.NumCols() == 0 {
+		return exec(nil)
 	}
-	if err != nil {
-		return -1, s.ErrorHelper.Errorf(adbc.StatusIO, "execute failed: %s", err)
+	// A bound batch with zero rows executes zero times.
+	if s.bindParams.NumRows() == 0 {
+		return 0, nil
 	}
 
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return -1, s.ErrorHelper.Errorf(adbc.StatusIO, "failed to get rows affected: %s", err)
+	// ADBC semantics: a bound batch executes the statement once per row.
+	var total int64
+	for row := 0; row < int(s.bindParams.NumRows()); row++ {
+		affected, err := exec(s.extractBindArgs(row))
+		if err != nil {
+			return total, err
+		}
+		total += affected
 	}
-	return affected, nil
+	return total, nil
 }
 
 // extractBindArgs extracts parameter values from the bind RecordBatch at the given row index.
@@ -227,24 +299,35 @@ func extractArrowValue(arr arrow.Array, idx int) interface{} {
 	case *array.Uint32:
 		return int64(a.Value(idx))
 	case *array.Uint64:
-		return int64(a.Value(idx))
+		// Route through decimal text — uint64 can exceed int64.
+		return strconv.FormatUint(a.Value(idx), 10)
 	case *array.Float32:
 		return float64(a.Value(idx))
 	case *array.Float64:
 		return a.Value(idx)
 	case *array.Decimal128:
 		return a.Value(idx).ToString(a.DataType().(*arrow.Decimal128Type).Scale)
+	case *array.Decimal256:
+		return a.Value(idx).ToString(a.DataType().(*arrow.Decimal256Type).Scale)
 	case *array.String:
 		return a.Value(idx)
 	case *array.LargeString:
 		return a.Value(idx)
 	case *array.Binary:
 		return a.Value(idx)
+	case *array.LargeBinary:
+		return a.Value(idx)
 	case *array.Boolean:
 		return a.Value(idx)
 	case *array.Timestamp:
-		return a.Value(idx).ToTime(arrow.Microsecond)
+		dt := a.DataType().(*arrow.TimestampType)
+		if toTime, err := dt.GetToTimeFunc(); err == nil {
+			return toTime(a.Value(idx))
+		}
+		return a.Value(idx).ToTime(dt.Unit)
 	case *array.Date32:
+		return a.Value(idx).ToTime()
+	case *array.Date64:
 		return a.Value(idx).ToTime()
 	default:
 		// Fallback: use the string representation
@@ -272,29 +355,80 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 		mode = adbc.OptionValueIngestModeCreate
 	}
 
+	// Resolve per-column Oracle DDL types. In "auto" mode, sizing string
+	// columns requires looking at the data: VARCHAR2 caps at 4000 bytes, so
+	// wider values must land in CLOB (ORA-12899 otherwise). For a bound
+	// stream, buffer records up to the scan limit while scanning widths;
+	// buffered records are inserted first, then the rest of the stream.
+	var buffered []arrow.RecordBatch
+	bufferedOwned := true // until handed to the insert pipeline
+	defer func() {
+		if bufferedOwned {
+			for _, rec := range buffered {
+				rec.Release()
+			}
+		}
+	}()
+
+	var colTypes []string
+	if mode != adbc.OptionValueIngestModeAppend {
+		var widths []int
+		if s.needsStringScan(schema) {
+			widths = make([]int, schema.NumFields())
+			limit := s.ingestScanLimitByte
+			if !s.ingestScanLimitSet {
+				limit = defaultTypeScanLimitBytes
+			}
+			// Same source precedence as the insert loop below: a bound stream
+			// wins over bound params, so we always size from the data we insert.
+			switch {
+			case s.bindStream == nil:
+				scanStringWidths(s.bindParams, widths)
+			case limit == 0:
+				// Scan explicitly disabled — fall back to data-independent
+				// defaults (LargeString → CLOB, String → VARCHAR2).
+				widths = nil
+			default:
+				var seen int64
+				for seen < limit && s.bindStream.Next() {
+					rec := s.bindStream.Record()
+					rec.Retain()
+					buffered = append(buffered, rec)
+					seen += recordSizeEstimate(rec)
+					scanStringWidths(rec, widths)
+				}
+				// Only io errors are visible here; end-of-stream is fine
+				// (small streams fit entirely inside the scan window).
+				if err := s.bindStream.Err(); err != nil {
+					return -1, s.ErrorHelper.Errorf(adbc.StatusIO, "bind stream error: %s", err)
+				}
+			}
+		}
+		colTypes = resolveColumnTypes(schema, widths, s.ingestStringType, s.ingestClobColumns)
+		for i, f := range schema.Fields() {
+			if colTypes[i] == "CLOB" && s.cnxn.Logger != nil {
+				s.cnxn.Logger.Info("oracle ingest: string column mapped to CLOB",
+					"table", tableName, "column", strings.ToUpper(f.Name))
+			}
+		}
+	}
+
 	// Handle table creation/replacement based on mode
-	if err := s.prepareIngestTable(ctx, tableName, schema, mode); err != nil {
+	if err := s.prepareIngestTable(ctx, tableName, schema, mode, colTypes); err != nil {
 		return -1, err
 	}
 
 	// Build INSERT statement.
-	// Geometry columns use SDO_UTIL.FROM_WKBGEOMETRY for server-side WKB conversion.
-	// This bypasses go-ora's UDT serialization which has known encoding issues
-	// with SDO_GEOMETRY (ORA-13031 Invalid Gtype, ORA-00600 kopi2_readlen083).
+	// Geometry columns are converted client-side from WKB to SdoGeometry UDT
+	// structs and sent via go-ora's Object encoding (see wkbColumnToSdoSliceRange).
 	colNames := make([]string, schema.NumFields())
 	placeholders := make([]string, schema.NumFields())
 	geomCols := make(map[int]int64) // col index → srid
 	for i, f := range schema.Fields() {
 		colNames[i] = fmt.Sprintf(`"%s"`, strings.ToUpper(f.Name))
+		placeholders[i] = fmt.Sprintf(":%d", i+1)
 		if isGeometryColumn(f) {
-			srid := extractSRIDFromField(f)
-			geomCols[i] = srid
-			// Direct UDT bind: WKB is converted client-side to SdoGeometry structs
-			// and sent via go-ora's Object encoding. This bypasses server-side
-			// SDO_GEOMETRY(TO_BLOB()) parsing for better throughput.
-			placeholders[i] = fmt.Sprintf(":%d", i+1)
-		} else {
-			placeholders[i] = fmt.Sprintf(":%d", i+1)
+			geomCols[i] = extractSRIDFromField(f)
 		}
 	}
 	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
@@ -310,6 +444,8 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 	// (Oracle interprets al8i4[1]>1 as batch execution, triggering ORA-38910).
 	// NOLOGGING alone still reduces redo I/O for conventional inserts.
 	s.cnxn.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s NOLOGGING", tableName))
+	// Restore logging on every exit path, not just success.
+	defer s.cnxn.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s LOGGING", tableName))
 
 	var totalRows int64
 
@@ -321,27 +457,64 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 			nrow int
 		}
 
+		convert := func(rec arrow.RecordBatch) preparedBatch {
+			nrow := int(rec.NumRows())
+			args := make([]interface{}, int(rec.NumCols()))
+			for col := 0; col < int(rec.NumCols()); col++ {
+				arr := rec.Column(col)
+				if srid, ok := s.ingestGeomCols[col]; ok {
+					// Convert WKB to SdoGeometry UDT objects client-side.
+					// This also copies the data, so Arrow buffer reuse is safe.
+					args[col] = wkbColumnToSdoSliceRange(arr, 0, nrow, srid)
+				} else {
+					args[col] = arrowColumnToSliceRange(arr, 0, nrow)
+				}
+			}
+			return preparedBatch{args: args, nrow: nrow}
+		}
+
 		ahead := make(chan preparedBatch, 1)
+		done := make(chan struct{})
+		prodExited := make(chan struct{})
+		// Join the producer before returning (defers run LIFO: close(done)
+		// unblocks it first). Otherwise an early error return would leave the
+		// goroutine using bindStream while the caller Closes or re-executes
+		// the statement.
+		defer func() { <-prodExited }()
+		defer close(done)
+		bufferedOwned = false // producer goroutine releases buffered records
 		go func() {
+			defer close(prodExited)
 			defer close(ahead)
-			for s.bindStream.Next() {
-				rec := s.bindStream.Record()
-				nrow := int(rec.NumRows())
-				if nrow == 0 {
-					continue
+			send := func(rec arrow.RecordBatch) bool {
+				if rec.NumRows() == 0 {
+					return true
 				}
-				args := make([]interface{}, int(rec.NumCols()))
-				for col := 0; col < int(rec.NumCols()); col++ {
-					arr := rec.Column(col)
-					if srid, ok := s.ingestGeomCols[col]; ok {
-						// Convert WKB to SdoGeometry UDT objects client-side.
-						// This also copies the data, so Arrow buffer reuse is safe.
-						args[col] = wkbColumnToSdoSliceRange(arr, 0, nrow, srid)
-					} else {
-						args[col] = arrowColumnToSliceRange(arr, 0, nrow)
+				pb := convert(rec)
+				select {
+				case ahead <- pb:
+					return true
+				case <-done:
+					// Consumer bailed out (insert error); stop converting so
+					// this goroutine doesn't block forever on a full channel.
+					return false
+				}
+			}
+			for i, rec := range buffered {
+				ok := send(rec)
+				rec.Release()
+				buffered[i] = nil
+				if !ok {
+					for _, r := range buffered[i+1:] {
+						r.Release()
 					}
+					return
 				}
-				ahead <- preparedBatch{args: args, nrow: nrow}
+			}
+			for s.bindStream.Next() {
+				if !send(s.bindStream.Record()) {
+					return
+				}
 			}
 		}()
 
@@ -362,9 +535,6 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 		}
 		totalRows = n
 	}
-
-	// Restore logging after bulk ingest
-	s.cnxn.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s LOGGING", tableName))
 
 	return totalRows, nil
 }
@@ -497,6 +667,14 @@ func (s *statementImpl) insertPreparedBatch(ctx context.Context, insertSQL strin
 
 	_, err = stmt.ExecContext(ctx, args...)
 	if err != nil {
+		if isOraCode(err, 12899) {
+			// A string wider than the scan window predicted slipped past the
+			// auto sizing; tell the caller how to force CLOB.
+			return 0, s.ErrorHelper.Errorf(adbc.StatusIO,
+				"batch insert failed: %s (hint: value exceeds the column width chosen by the "+
+					"auto type scan — set %s for the affected column, or %s=clob)",
+				err, OptionIngestClobColumns, OptionIngestStringType)
+		}
 		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "batch insert failed: %s", err)
 	}
 
@@ -507,150 +685,235 @@ func (s *statementImpl) insertPreparedBatch(ctx context.Context, insertSQL strin
 	return int64(numRows), nil
 }
 
-func (s *statementImpl) insertBatch(ctx context.Context, stmt *sql.Stmt, rec arrow.RecordBatch) (int64, error) {
-	numRows := int(rec.NumRows())
-	numCols := int(rec.NumCols())
-
-	// Build columnar arrays for go-ora batch insert.
-	// Geometry columns pass raw WKB bytes for server-side conversion via SDO_GEOMETRY(:N, srid).
-	args := make([]interface{}, numCols)
-	for col := 0; col < numCols; col++ {
-		arr := rec.Column(col)
-		if _, ok := s.ingestGeomCols[col]; ok {
-			args[col] = wkbColumnToRawSlice(arr, numRows)
-		} else {
-			args[col] = arrowColumnToSlice(arr, numRows)
-		}
-	}
-
-	_, err := stmt.ExecContext(ctx, args...)
-	if err != nil {
-		return 0, s.ErrorHelper.Errorf(adbc.StatusIO, "batch insert failed: %s", err)
-	}
-
-	if _, err := s.cnxn.db.ExecContext(ctx, "COMMIT"); err != nil {
-		return int64(numRows), s.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
-	}
-
-	return int64(numRows), nil
-}
-
-// arrowColumnToSliceRange extracts a range [start, end) from an Arrow column to a Go slice.
+// arrowColumnToSliceRange extracts a range [start, end) from an Arrow column
+// into a Go slice for go-ora's bulk array bind.
+//
+// Values must be bound in the driver-native representation, not stringified:
+// stringified timestamps hit Oracle's implicit TO_DATE with an NLS format mask
+// and fail on the ISO-8601 'T' separator (ORA-01858); stringified booleans
+// ("true") fail NUMBER(1) conversion (ORA-01722).
+//
+// Everything variable-length is deep-copied: Arrow Value() calls alias the
+// underlying buffer, which is released when the next stream record arrives.
+// Holding the alias past that point produces use-after-free corruption
+// (manifests as garbled VARCHAR2 columns through Oracle's bulk array bind).
 func arrowColumnToSliceRange(arr arrow.Array, start, end int) interface{} {
 	numRows := end - start
 	switch a := arr.(type) {
 	case *array.Int64:
-		vals := make([]sql.NullInt64, numRows)
-		for i := start; i < end; i++ {
-			if a.IsNull(i) {
-				vals[i-start] = sql.NullInt64{}
-			} else {
-				vals[i-start] = sql.NullInt64{Int64: a.Value(i), Valid: true}
-			}
-		}
-		return vals
+		return intColumnToSlice(a, start, end, func(v int64) int64 { return v })
 	case *array.Int32:
-		vals := make([]sql.NullInt64, numRows)
+		return intColumnToSlice(a, start, end, func(v int32) int64 { return int64(v) })
+	case *array.Int16:
+		return intColumnToSlice(a, start, end, func(v int16) int64 { return int64(v) })
+	case *array.Int8:
+		return intColumnToSlice(a, start, end, func(v int8) int64 { return int64(v) })
+	case *array.Uint32:
+		return intColumnToSlice(a, start, end, func(v uint32) int64 { return int64(v) })
+	case *array.Uint16:
+		return intColumnToSlice(a, start, end, func(v uint16) int64 { return int64(v) })
+	case *array.Uint8:
+		return intColumnToSlice(a, start, end, func(v uint8) int64 { return int64(v) })
+	case *array.Uint64:
+		// uint64 can exceed int64; bind the decimal text and let NUMBER(20)
+		// take it exactly.
+		vals := make([]sql.NullString, numRows)
 		for i := start; i < end; i++ {
-			if a.IsNull(i) {
-				vals[i-start] = sql.NullInt64{}
-			} else {
-				vals[i-start] = sql.NullInt64{Int64: int64(a.Value(i)), Valid: true}
+			if !a.IsNull(i) {
+				vals[i-start] = sql.NullString{String: strconv.FormatUint(a.Value(i), 10), Valid: true}
 			}
 		}
 		return vals
 	case *array.Float64:
 		vals := make([]sql.NullFloat64, numRows)
 		for i := start; i < end; i++ {
-			if a.IsNull(i) {
-				vals[i-start] = sql.NullFloat64{}
-			} else {
+			if !a.IsNull(i) {
 				vals[i-start] = sql.NullFloat64{Float64: a.Value(i), Valid: true}
 			}
 		}
 		return vals
-	case *array.String:
-		// Deep-copy: a.Value(i) aliases the Arrow buffer, which is released
-		// when the next stream record arrives. Holding the alias past that
-		// point produces use-after-free corruption (manifests as garbled
-		// VARCHAR2 columns through Oracle's bulk array bind).
-		vals := make([]sql.NullString, numRows)
-		for i := start; i < end; i++ {
-			if a.IsNull(i) {
-				vals[i-start] = sql.NullString{}
-			} else {
-				vals[i-start] = sql.NullString{String: strings.Clone(a.Value(i)), Valid: true}
-			}
-		}
-		return vals
-	case *array.Binary:
-		// Deep-copy for the same reason as *array.String above.
-		vals := make([][]byte, numRows)
+	case *array.Float32:
+		vals := make([]sql.NullFloat64, numRows)
 		for i := start; i < end; i++ {
 			if !a.IsNull(i) {
-				src := a.Value(i)
-				dst := make([]byte, len(src))
-				copy(dst, src)
-				vals[i-start] = dst
+				vals[i-start] = sql.NullFloat64{Float64: float64(a.Value(i)), Valid: true}
 			}
 		}
 		return vals
+	case *array.Boolean:
+		// NUMBER(1) column, bound as explicit 0/1 (stringified "true"/"false"
+		// would fail the implicit NUMBER conversion with ORA-01722).
+		vals := make([]sql.NullInt64, numRows)
+		for i := start; i < end; i++ {
+			if !a.IsNull(i) {
+				var v int64
+				if a.Value(i) {
+					v = 1
+				}
+				vals[i-start] = sql.NullInt64{Int64: v, Valid: true}
+			}
+		}
+		return vals
+	case *array.String:
+		return stringColumnToSlice(a, start, end)
+	case *array.LargeString:
+		return stringColumnToSlice(a, start, end)
+	case *array.Binary:
+		return binaryColumnToSlice(a, start, end)
+	case *array.LargeBinary:
+		return binaryColumnToSlice(a, start, end)
+	case *array.FixedSizeBinary:
+		return binaryColumnToSlice(a, start, end)
+	case *array.BinaryView:
+		return binaryColumnToSlice(a, start, end)
 	case *array.Decimal128:
 		vals := make([]sql.NullString, numRows)
 		scale := a.DataType().(*arrow.Decimal128Type).Scale
 		for i := start; i < end; i++ {
-			if a.IsNull(i) {
-				vals[i-start] = sql.NullString{}
-			} else {
+			if !a.IsNull(i) {
 				vals[i-start] = sql.NullString{String: a.Value(i).ToString(scale), Valid: true}
 			}
 		}
 		return vals
+	case *array.Decimal256:
+		vals := make([]sql.NullString, numRows)
+		scale := a.DataType().(*arrow.Decimal256Type).Scale
+		for i := start; i < end; i++ {
+			if !a.IsNull(i) {
+				vals[i-start] = sql.NullString{String: a.Value(i).ToString(scale), Valid: true}
+			}
+		}
+		return vals
+	case *array.Timestamp:
+		return timestampColumnToSlice(a, start, end)
+	case *array.Date32:
+		vals := make([]go_ora.NullTimeStamp, numRows)
+		for i := start; i < end; i++ {
+			if !a.IsNull(i) {
+				vals[i-start] = go_ora.NullTimeStamp{TimeStamp: go_ora.TimeStamp(a.Value(i).ToTime()), Valid: true}
+			}
+		}
+		return vals
+	case *array.Date64:
+		vals := make([]go_ora.NullTimeStamp, numRows)
+		for i := start; i < end; i++ {
+			if !a.IsNull(i) {
+				vals[i-start] = go_ora.NullTimeStamp{TimeStamp: go_ora.TimeStamp(a.Value(i).ToTime()), Valid: true}
+			}
+		}
+		return vals
+	case *array.StringView:
+		return stringColumnToSlice(a, start, end)
 	default:
+		// Remaining types (Time32/64, Duration, Interval, Dictionary, nested…)
+		// have no natural Oracle mapping; bind their textual form into the
+		// VARCHAR2 fallback column. Clone defensively: some ValueStr
+		// implementations (Dictionary, RunEndEncoded) alias the Arrow buffer.
 		vals := make([]sql.NullString, numRows)
 		for i := start; i < end; i++ {
-			if arr.IsNull(i) {
-				vals[i-start] = sql.NullString{}
-			} else {
-				vals[i-start] = sql.NullString{String: arr.ValueStr(i), Valid: true}
+			if !arr.IsNull(i) {
+				vals[i-start] = sql.NullString{String: strings.Clone(arr.ValueStr(i)), Valid: true}
 			}
 		}
 		return vals
 	}
 }
 
-// wkbColumnToRawSliceRange extracts raw WKB bytes from a range [start, end) of a binary column.
-// These bytes are passed to SDO_GEOMETRY(:N, srid) for server-side conversion.
-func wkbColumnToRawSliceRange(arr arrow.Array, start, end int) interface{} {
-	binArr, ok := arr.(*array.Binary)
-	if !ok {
-		return make([][]byte, end-start)
-	}
-
-	vals := make([][]byte, end-start)
+// intColumnToSlice converts any fixed-width integer Arrow array to NullInt64s.
+func intColumnToSlice[T int64 | int32 | int16 | int8 | uint32 | uint16 | uint8](
+	a interface {
+		arrow.Array
+		Value(int) T
+	}, start, end int, conv func(T) int64,
+) []sql.NullInt64 {
+	vals := make([]sql.NullInt64, end-start)
 	for i := start; i < end; i++ {
-		if !binArr.IsNull(i) {
-			vals[i-start] = binArr.Value(i)
+		if !a.IsNull(i) {
+			vals[i-start] = sql.NullInt64{Int64: conv(a.Value(i)), Valid: true}
 		}
 	}
 	return vals
 }
 
-// wkbColumnToRawSliceCopy extracts raw WKB bytes with deep copies.
-// Used by the pipeline path where Arrow buffers may be freed before insert completes.
-func wkbColumnToRawSliceCopy(arr arrow.Array, start, end int) interface{} {
-	binArr, ok := arr.(*array.Binary)
-	if !ok {
-		return make([][]byte, end-start)
+// stringColumnToSlice deep-copies string values (see aliasing note above).
+//
+// Batches whose widest value exceeds the VARCHAR2 cap bind as go_ora.Clob:
+// plain string binds ride go-ora's negotiated varchar limit (4000 bytes on
+// MAX_STRING_SIZE=STANDARD servers, 32767 on EXTENDED), so a wide value could
+// fail at bind time even though the destination column is CLOB. The bind type
+// is chosen per batch — narrow batches keep the cheaper varchar bind, which
+// Oracle implicitly converts into CLOB columns.
+func stringColumnToSlice(a interface {
+	arrow.Array
+	Value(int) string
+}, start, end int) interface{} {
+	vals := make([]sql.NullString, end-start)
+	maxWidth := 0
+	for i := start; i < end; i++ {
+		if !a.IsNull(i) {
+			v := strings.Clone(a.Value(i))
+			if len(v) > maxWidth {
+				maxWidth = len(v)
+			}
+			vals[i-start] = sql.NullString{String: v, Valid: true}
+		}
 	}
+	if maxWidth <= maxInlineStringBytes {
+		return vals
+	}
+	lobs := make([]go_ora.Clob, len(vals))
+	for i, v := range vals {
+		lobs[i] = go_ora.Clob{String: v.String, Valid: v.Valid}
+	}
+	return lobs
+}
 
+// binaryColumnToSlice deep-copies binary values (see aliasing note above).
+func binaryColumnToSlice(a interface {
+	arrow.Array
+	Value(int) []byte
+}, start, end int) [][]byte {
 	vals := make([][]byte, end-start)
 	for i := start; i < end; i++ {
-		if !binArr.IsNull(i) {
-			src := binArr.Value(i)
+		if !a.IsNull(i) {
+			src := a.Value(i)
 			dst := make([]byte, len(src))
 			copy(dst, src)
 			vals[i-start] = dst
+		}
+	}
+	return vals
+}
+
+// timestampColumnToSlice binds timestamps in the driver's native temporal form.
+//
+// Naive (no time zone) columns bind as go_ora.TimeStamp — wire-level Oracle
+// TIMESTAMP carrying the wall-clock fields — so the value lands verbatim with
+// no session-time-zone conversion. Zone-aware columns bind as time.Time, which
+// go-ora encodes as TIMESTAMP WITH TIME ZONE, preserving the absolute instant.
+func timestampColumnToSlice(a *array.Timestamp, start, end int) interface{} {
+	dt := a.DataType().(*arrow.TimestampType)
+	toTime, err := dt.GetToTimeFunc()
+	if err != nil {
+		// Unloadable time zone — fall back to UTC-based conversion.
+		unit := dt.Unit
+		toTime = func(ts arrow.Timestamp) time.Time { return ts.ToTime(unit) }
+	}
+
+	if dt.TimeZone == "" {
+		vals := make([]go_ora.NullTimeStamp, end-start)
+		for i := start; i < end; i++ {
+			if !a.IsNull(i) {
+				vals[i-start] = go_ora.NullTimeStamp{TimeStamp: go_ora.TimeStamp(toTime(a.Value(i))), Valid: true}
+			}
+		}
+		return vals
+	}
+
+	vals := make([]sql.NullTime, end-start)
+	for i := start; i < end; i++ {
+		if !a.IsNull(i) {
+			vals[i-start] = sql.NullTime{Time: toTime(a.Value(i)), Valid: true}
 		}
 	}
 	return vals
@@ -680,168 +943,52 @@ func wkbColumnToSdoSliceRange(arr arrow.Array, start, end int, srid int64) inter
 	return vals
 }
 
-// arrowColumnToSlice converts an Arrow array to a Go slice for go-ora batch insert.
-// For geometry columns (isGeom=true), WKB binary is converted to SdoGeometry UDT objects.
-func arrowColumnToSlice(arr arrow.Array, numRows int) interface{} {
-	return arrowColumnToSliceWithGeom(arr, numRows, false, 4326)
-}
-
-func arrowColumnToSliceGeom(arr arrow.Array, numRows int, srid int64) interface{} {
-	return arrowColumnToSliceWithGeom(arr, numRows, true, srid)
-}
-
-func arrowColumnToSliceWithGeom(arr arrow.Array, numRows int, isGeom bool, srid int64) interface{} {
-	if isGeom {
-		return wkbColumnToSdoSlice(arr, numRows, srid)
-	}
-	switch a := arr.(type) {
-	case *array.Int64:
-		vals := make([]sql.NullInt64, numRows)
-		for i := 0; i < numRows; i++ {
-			if a.IsNull(i) {
-				vals[i] = sql.NullInt64{}
-			} else {
-				vals[i] = sql.NullInt64{Int64: a.Value(i), Valid: true}
-			}
-		}
-		return vals
-	case *array.Int32:
-		vals := make([]sql.NullInt64, numRows)
-		for i := 0; i < numRows; i++ {
-			if a.IsNull(i) {
-				vals[i] = sql.NullInt64{}
-			} else {
-				vals[i] = sql.NullInt64{Int64: int64(a.Value(i)), Valid: true}
-			}
-		}
-		return vals
-	case *array.Float64:
-		vals := make([]sql.NullFloat64, numRows)
-		for i := 0; i < numRows; i++ {
-			if a.IsNull(i) {
-				vals[i] = sql.NullFloat64{}
-			} else {
-				vals[i] = sql.NullFloat64{Float64: a.Value(i), Valid: true}
-			}
-		}
-		return vals
-	case *array.String:
-		// See note on the deep copy in arrowColumnToSliceRange — Arrow
-		// String.Value aliases the underlying buffer, which can be freed
-		// before Oracle's array bind reads the value.
-		vals := make([]sql.NullString, numRows)
-		for i := 0; i < numRows; i++ {
-			if a.IsNull(i) {
-				vals[i] = sql.NullString{}
-			} else {
-				vals[i] = sql.NullString{String: strings.Clone(a.Value(i)), Valid: true}
-			}
-		}
-		return vals
-	case *array.Binary:
-		vals := make([][]byte, numRows)
-		for i := 0; i < numRows; i++ {
-			if !a.IsNull(i) {
-				src := a.Value(i)
-				dst := make([]byte, len(src))
-				copy(dst, src)
-				vals[i] = dst
-			}
-		}
-		return vals
-	case *array.Decimal128:
-		vals := make([]sql.NullString, numRows)
-		scale := a.DataType().(*arrow.Decimal128Type).Scale
-		for i := 0; i < numRows; i++ {
-			if a.IsNull(i) {
-				vals[i] = sql.NullString{}
-			} else {
-				vals[i] = sql.NullString{String: a.Value(i).ToString(scale), Valid: true}
-			}
-		}
-		return vals
-	default:
-		// Fallback: convert to string slice
-		vals := make([]sql.NullString, numRows)
-		for i := 0; i < numRows; i++ {
-			if arr.IsNull(i) {
-				vals[i] = sql.NullString{}
-			} else {
-				vals[i] = sql.NullString{String: arr.ValueStr(i), Valid: true}
-			}
-		}
-		return vals
-	}
-}
-
-// wkbColumnToRawSlice extracts raw WKB bytes from a binary column.
-// These bytes are passed to SDO_GEOMETRY(:N, srid) for server-side conversion.
-func wkbColumnToRawSlice(arr arrow.Array, numRows int) interface{} {
-	binArr, ok := arr.(*array.Binary)
-	if !ok {
-		return make([][]byte, numRows)
-	}
-
-	vals := make([][]byte, numRows)
-	for i := 0; i < numRows; i++ {
-		if !binArr.IsNull(i) {
-			vals[i] = binArr.Value(i)
-		}
-	}
-	return vals
-}
-
-// wkbColumnToSdoSlice converts a WKB binary column to a slice of go-ora Objects
-// containing SdoGeometry structs for direct UDT insert.
-func wkbColumnToSdoSlice(arr arrow.Array, numRows int, srid int64) interface{} {
-	binArr, ok := arr.(*array.Binary)
-	if !ok {
-		// Fallback: return nil slice
-		return make([]*go_ora.Object, numRows)
-	}
-
-	vals := make([]*go_ora.Object, numRows)
-	for i := 0; i < numRows; i++ {
-		if binArr.IsNull(i) {
-			vals[i] = nil
-			continue
-		}
-		wkb := binArr.Value(i)
-		geom, err := WKBToSdo(wkb, srid)
-		if err != nil {
-			vals[i] = nil
-			continue
-		}
-		vals[i] = go_ora.NewObject("MDSYS", "SDO_GEOMETRY", *geom)
-	}
-	return vals
-}
-
-func (s *statementImpl) prepareIngestTable(ctx context.Context, tableName string, schema *arrow.Schema, mode string) error {
+func (s *statementImpl) prepareIngestTable(ctx context.Context, tableName string, schema *arrow.Schema, mode string, colTypes []string) error {
 	switch mode {
 	case adbc.OptionValueIngestModeCreate:
 		// Create table — fail if exists
-		ddl := buildCreateTableDDL(tableName, schema)
+		ddl := buildCreateTableDDL(tableName, schema, colTypes)
 		if _, err := s.cnxn.db.ExecContext(ctx, ddl); err != nil {
 			return s.ErrorHelper.Errorf(adbc.StatusIO, "create table failed: %s", err)
 		}
 	case adbc.OptionValueIngestModeAppend:
 		// Table must exist — do nothing
 	case adbc.OptionValueIngestModeReplace:
-		// Drop and recreate
-		s.cnxn.db.ExecContext(ctx, fmt.Sprintf("DROP TABLE %s PURGE", tableName))
-		ddl := buildCreateTableDDL(tableName, schema)
+		// Drop and recreate. A missing table (ORA-00942) is fine; any other
+		// drop failure would surface as a confusing ORA-00955 on the CREATE,
+		// so report it directly.
+		if _, err := s.cnxn.db.ExecContext(ctx, fmt.Sprintf("DROP TABLE %s PURGE", tableName)); err != nil && !isOraCode(err, 942) {
+			return s.ErrorHelper.Errorf(adbc.StatusIO, "drop table failed: %s", err)
+		}
+		ddl := buildCreateTableDDL(tableName, schema, colTypes)
 		if _, err := s.cnxn.db.ExecContext(ctx, ddl); err != nil {
 			return s.ErrorHelper.Errorf(adbc.StatusIO, "create table failed: %s", err)
 		}
 	case adbc.OptionValueIngestModeCreateAppend:
-		// Create if not exists, append if exists
-		ddl := buildCreateTableDDL(tableName, schema)
-		s.cnxn.db.ExecContext(ctx, ddl) // ignore error (table may exist)
+		// Create if not exists, append if exists. Only ORA-00955 ("name is
+		// already used") means "exists" — anything else is a real failure.
+		ddl := buildCreateTableDDL(tableName, schema, colTypes)
+		if _, err := s.cnxn.db.ExecContext(ctx, ddl); err != nil && !isOraCode(err, 955) {
+			return s.ErrorHelper.Errorf(adbc.StatusIO, "create table failed: %s", err)
+		}
 	default:
 		return s.ErrorHelper.Errorf(adbc.StatusInvalidArgument, "unknown ingest mode: %s", mode)
 	}
 	return nil
+}
+
+// isOraCode reports whether err carries the given Oracle error code
+// (e.g. 942 for "ORA-00942: table or view does not exist").
+func isOraCode(err error, code int) bool {
+	if err == nil {
+		return false
+	}
+	var oraErr *network.OracleError
+	if errors.As(err, &oraErr) {
+		return oraErr.ErrCode == code
+	}
+	// database/sql can wrap the driver error in plain-text form.
+	return strings.Contains(err.Error(), fmt.Sprintf("ORA-%05d", code))
 }
 
 // isGeometryColumn checks if an Arrow field is a geometry column.
@@ -909,51 +1056,212 @@ func extractSRIDFromField(f arrow.Field) int64 {
 	return 4326
 }
 
-func buildCreateTableDDL(tableName string, schema *arrow.Schema) string {
-	var cols []string
+// maxInlineStringBytes is the VARCHAR2 byte cap (with MAX_STRING_SIZE=STANDARD).
+// String values wider than this must be stored as CLOB.
+const maxInlineStringBytes = 4000
+
+// defaultTypeScanLimitBytes bounds how much of a bound stream executeBulkIngest
+// buffers while sizing string columns in "auto" mode (~64 MiB keeps a couple of
+// wide DuckDB batches without holding the whole table in memory).
+const defaultTypeScanLimitBytes = 64 << 20
+
+// needsStringScan reports whether the schema has string columns whose DDL type
+// depends on observed data widths (i.e. "auto" mode with nothing forcing CLOB).
+func (s *statementImpl) needsStringScan(schema *arrow.Schema) bool {
+	if s.ingestStringType == "varchar2" || s.ingestStringType == "clob" {
+		return false
+	}
 	for _, f := range schema.Fields() {
-		var oraType string
-		if isGeometryColumn(f) {
-			oraType = "MDSYS.SDO_GEOMETRY"
-		} else {
-			oraType = arrowToOracleType(f.Type)
+		id := f.Type.ID()
+		if (id == arrow.STRING || id == arrow.STRING_VIEW || id == arrow.LARGE_STRING) &&
+			!s.ingestClobColumns[strings.ToUpper(f.Name)] {
+			return true
 		}
+	}
+	return false
+}
+
+// scanStringWidths updates widths[i] with the maximum value byte-length seen
+// in rec for each string column. len(Value(i)) reads the offsets only — no
+// value bytes are copied.
+func scanStringWidths(rec arrow.RecordBatch, widths []int) {
+	for col := 0; col < int(rec.NumCols()) && col < len(widths); col++ {
+		switch a := rec.Column(col).(type) {
+		case *array.String:
+			for i := 0; i < a.Len(); i++ {
+				if !a.IsNull(i) {
+					if n := len(a.Value(i)); n > widths[col] {
+						widths[col] = n
+					}
+				}
+			}
+		case *array.LargeString:
+			for i := 0; i < a.Len(); i++ {
+				if !a.IsNull(i) {
+					if n := len(a.Value(i)); n > widths[col] {
+						widths[col] = n
+					}
+				}
+			}
+		case *array.StringView:
+			for i := 0; i < a.Len(); i++ {
+				if !a.IsNull(i) {
+					if n := len(a.Value(i)); n > widths[col] {
+						widths[col] = n
+					}
+				}
+			}
+		}
+	}
+}
+
+// recordSizeEstimate approximates the in-memory size of a record batch by
+// summing its Arrow buffer lengths, recursing into child data (list/struct
+// values, dictionaries) — top-level buffers alone are just validity+offsets
+// for nested types and would undercount by orders of magnitude.
+func recordSizeEstimate(rec arrow.RecordBatch) int64 {
+	var total int64
+	for col := 0; col < int(rec.NumCols()); col++ {
+		total += arrayDataSize(rec.Column(col).Data())
+	}
+	return total
+}
+
+func arrayDataSize(data arrow.ArrayData) int64 {
+	// Dictionary() and children can surface a typed-nil *array.Data (seen on
+	// records imported through the C data interface) — the interface itself
+	// is non-nil, so check the concrete pointer too.
+	if data == nil {
+		return 0
+	}
+	if d, ok := data.(*array.Data); ok && d == nil {
+		return 0
+	}
+	var total int64
+	for _, buf := range data.Buffers() {
+		if buf != nil {
+			total += int64(buf.Len())
+		}
+	}
+	for _, child := range data.Children() {
+		total += arrayDataSize(child)
+	}
+	total += arrayDataSize(data.Dictionary())
+	return total
+}
+
+// resolveColumnTypes decides the Oracle DDL type for every column.
+//
+// String columns are the interesting case: VARCHAR2 caps at 4000 bytes, so
+//   - stringType "clob" / "varchar2" forces that type for all string columns;
+//   - clobColumns (uppercased names) forces CLOB for specific columns;
+//   - otherwise ("auto") a column becomes CLOB when the scanned data contains
+//     a value wider than 4000 bytes (widths[i], from scanStringWidths). With
+//     no scan data at all, LargeString columns fall back to CLOB — producers
+//     use the large layout precisely when values are big — while regular
+//     strings stay VARCHAR2.
+//
+// widths may be nil when no scan ran (forced types, or scan disabled).
+func resolveColumnTypes(schema *arrow.Schema, widths []int, stringType string, clobColumns map[string]bool) []string {
+	types := make([]string, schema.NumFields())
+	for i, f := range schema.Fields() {
+		if isGeometryColumn(f) {
+			types[i] = "MDSYS.SDO_GEOMETRY"
+			continue
+		}
+		id := f.Type.ID()
+		if id == arrow.STRING || id == arrow.LARGE_STRING || id == arrow.STRING_VIEW {
+			switch {
+			case clobColumns[strings.ToUpper(f.Name)] || stringType == "clob":
+				types[i] = "CLOB"
+			case stringType == "varchar2":
+				types[i] = fmt.Sprintf("VARCHAR2(%d)", maxInlineStringBytes)
+			case widths != nil && i < len(widths) && widths[i] > maxInlineStringBytes:
+				types[i] = "CLOB"
+			case widths == nil && id == arrow.LARGE_STRING:
+				types[i] = "CLOB"
+			default:
+				types[i] = fmt.Sprintf("VARCHAR2(%d)", maxInlineStringBytes)
+			}
+			continue
+		}
+		types[i] = arrowToOracleType(f.Type)
+	}
+	return types
+}
+
+// buildCreateTableDDL renders CREATE TABLE DDL. colTypes comes from
+// resolveColumnTypes; pass nil to use data-independent defaults.
+func buildCreateTableDDL(tableName string, schema *arrow.Schema, colTypes []string) string {
+	if colTypes == nil {
+		colTypes = resolveColumnTypes(schema, nil, "", nil)
+	}
+	var cols []string
+	for i, f := range schema.Fields() {
 		nullable := ""
-		if !f.Nullable {
+		// Oracle stores '' as NULL, so a NOT NULL string column would reject
+		// legitimate empty strings — skip the constraint for string types.
+		id := f.Type.ID()
+		isString := id == arrow.STRING || id == arrow.LARGE_STRING || id == arrow.STRING_VIEW
+		if !f.Nullable && !isString {
 			nullable = " NOT NULL"
 		}
-		cols = append(cols, fmt.Sprintf(`"%s" %s%s`, strings.ToUpper(f.Name), oraType, nullable))
+		cols = append(cols, fmt.Sprintf(`"%s" %s%s`, strings.ToUpper(f.Name), colTypes[i], nullable))
 	}
 	return fmt.Sprintf("CREATE TABLE %s (%s) NOLOGGING", tableName, strings.Join(cols, ", "))
 }
 
+// arrowToOracleType maps a non-string, non-geometry Arrow type to Oracle DDL.
+// String columns are resolved by resolveColumnTypes, which sizes them from
+// the data; the mapping here must stay bind-compatible with
+// arrowColumnToSliceRange.
 func arrowToOracleType(dt arrow.DataType) string {
 	switch dt.ID() {
 	case arrow.INT8, arrow.INT16, arrow.INT32, arrow.INT64:
 		return "NUMBER(19)"
-	case arrow.UINT8, arrow.UINT16, arrow.UINT32, arrow.UINT64:
+	case arrow.UINT8, arrow.UINT16, arrow.UINT32:
 		return "NUMBER(19)"
+	case arrow.UINT64:
+		// uint64 max is 1.8e19 — one digit more than NUMBER(19) holds.
+		return "NUMBER(20)"
 	case arrow.FLOAT16, arrow.FLOAT32:
 		return "BINARY_FLOAT"
 	case arrow.FLOAT64:
 		return "BINARY_DOUBLE"
 	case arrow.DECIMAL128, arrow.DECIMAL256:
-		if dec, ok := dt.(*arrow.Decimal128Type); ok {
-			return fmt.Sprintf("NUMBER(%d,%d)", dec.Precision, dec.Scale)
+		if dec, ok := dt.(arrow.DecimalType); ok {
+			prec, scale := dec.GetPrecision(), dec.GetScale()
+			// Oracle NUMBER(p,s) caps p at 38. Clamping would reject values
+			// that legitimately fit the Arrow type (ORA-01438), so fall back
+			// to unconstrained NUMBER for anything wider.
+			if prec >= 1 && prec <= 38 && scale >= 0 && scale <= prec {
+				return fmt.Sprintf("NUMBER(%d,%d)", prec, scale)
+			}
 		}
 		return "NUMBER"
-	case arrow.STRING, arrow.LARGE_STRING:
-		return "VARCHAR2(4000)"
-	case arrow.BINARY, arrow.LARGE_BINARY:
+	case arrow.STRING, arrow.LARGE_STRING, arrow.STRING_VIEW:
+		return fmt.Sprintf("VARCHAR2(%d)", maxInlineStringBytes)
+	case arrow.BINARY, arrow.LARGE_BINARY, arrow.FIXED_SIZE_BINARY, arrow.BINARY_VIEW:
 		return "BLOB"
 	case arrow.BOOL:
 		return "NUMBER(1)"
 	case arrow.TIMESTAMP:
-		return "TIMESTAMP"
+		ts, ok := dt.(*arrow.TimestampType)
+		if !ok {
+			return "TIMESTAMP(6)"
+		}
+		prec := 6
+		if ts.Unit == arrow.Nanosecond {
+			prec = 9
+		}
+		if ts.TimeZone != "" {
+			return fmt.Sprintf("TIMESTAMP(%d) WITH TIME ZONE", prec)
+		}
+		return fmt.Sprintf("TIMESTAMP(%d)", prec)
 	case arrow.DATE32, arrow.DATE64:
 		return "DATE"
 	default:
-		return "VARCHAR2(4000)"
+		return fmt.Sprintf("VARCHAR2(%d)", maxInlineStringBytes)
 	}
 }
 
@@ -1173,6 +1481,9 @@ var timestampNoTZ = &arrow.TimestampType{Unit: arrow.Microsecond}
 func oracleTypeToArrow(ct *sql.ColumnType) arrow.DataType {
 	dbType := strings.ToUpper(ct.DatabaseTypeName())
 
+	// Note: go-ora's ColumnType.DatabaseTypeName returns TNS wire-type names
+	// (NCHAR, IBDouble, OCIBlobLocator, TimeStampDTY, …), not the DDL names
+	// from ALL_TAB_COLUMNS — match both here.
 	switch {
 	case dbType == "NUMBER":
 		precision, scale, ok := ct.DecimalSize()
@@ -1183,12 +1494,15 @@ func oracleTypeToArrow(ct *sql.ColumnType) arrow.DataType {
 			return arrow.BinaryTypes.String
 		}
 		return arrow.PrimitiveTypes.Float64
-	case dbType == "FLOAT" || dbType == "BINARY_FLOAT" || dbType == "BINARY_DOUBLE":
+	case dbType == "FLOAT" || dbType == "BINARY_FLOAT" || dbType == "BINARY_DOUBLE" ||
+		dbType == "IBFLOAT" || dbType == "IBDOUBLE" || // TNS names for BINARY_FLOAT/DOUBLE
+		dbType == "BFLOAT" || dbType == "BDOUBLE":
 		return arrow.PrimitiveTypes.Float64
 
 	case dbType == "VARCHAR2" || dbType == "VARCHAR" || dbType == "NVARCHAR2" ||
 		dbType == "CHAR" || dbType == "NCHAR" || dbType == "CLOB" || dbType == "NCLOB" ||
-		dbType == "LONG" || dbType == "ROWID":
+		dbType == "LONG" || dbType == "LONGVARCHAR" || dbType == "ROWID" || dbType == "UROWID" ||
+		dbType == "OCICLOBLOCATOR":
 		return arrow.BinaryTypes.String
 
 	case dbType == "DATE":
@@ -1199,10 +1513,11 @@ func oracleTypeToArrow(ct *sql.ColumnType) arrow.DataType {
 		strings.HasPrefix(dbType, "TIMESTAMP"):
 		return arrow.FixedWidthTypes.Timestamp_us
 
-	case dbType == "INTERVALYM_DTY" || dbType == "INTERVALDS_DTY":
+	case strings.HasPrefix(dbType, "INTERVAL"):
 		return arrow.BinaryTypes.String
 
-	case dbType == "RAW" || dbType == "LONG RAW" || dbType == "BLOB":
+	case dbType == "RAW" || dbType == "LONG RAW" || dbType == "LONGRAW" || dbType == "BLOB" ||
+		dbType == "OCIBLOBLOCATOR" || dbType == "OCIFILELOCATOR":
 		return arrow.BinaryTypes.Binary
 
 	case dbType == "BOOLEAN":

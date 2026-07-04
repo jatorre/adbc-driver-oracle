@@ -82,10 +82,10 @@ func (c *connectionImpl) GetTablesForDBSchema(ctx context.Context, catalog strin
 	query := `SELECT TABLE_NAME, TABLE_TYPE FROM (
 		SELECT TABLE_NAME, 'TABLE' AS TABLE_TYPE FROM ALL_TABLES WHERE OWNER = :1
 		UNION ALL
-		SELECT VIEW_NAME, 'VIEW' AS TABLE_TYPE FROM ALL_VIEWS WHERE OWNER = :1
+		SELECT VIEW_NAME, 'VIEW' AS TABLE_TYPE FROM ALL_VIEWS WHERE OWNER = :2
 	) ORDER BY TABLE_NAME`
 
-	rows, err := c.db.QueryContext(ctx, query, strings.ToUpper(schema))
+	rows, err := c.db.QueryContext(ctx, query, strings.ToUpper(schema), strings.ToUpper(schema))
 	if err != nil {
 		return nil, err
 	}
@@ -180,9 +180,13 @@ func (c *connectionImpl) ListTableTypes(ctx context.Context) ([]string, error) {
 // --- Metadata: GetTableSchema ---
 
 func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, dbSchema *string, tableName string) (*arrow.Schema, error) {
-	schema := "USER"
-	if dbSchema != nil {
+	var schema string
+	if dbSchema != nil && *dbSchema != "" {
 		schema = strings.ToUpper(*dbSchema)
+	} else if s, err := c.GetCurrentDbSchema(); err == nil {
+		schema = s
+	} else {
+		return nil, c.ErrorHelper.Errorf(adbc.StatusIO, "GetTableSchema: cannot resolve current schema: %s", err)
 	}
 
 	query := `SELECT COLUMN_NAME, DATA_TYPE, NULLABLE, DATA_PRECISION, DATA_SCALE

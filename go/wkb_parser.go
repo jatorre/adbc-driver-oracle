@@ -97,7 +97,10 @@ func parseWKBLineString(data []byte, bo binary.ByteOrder, dims int, srid int64) 
 		return nil, fmt.Errorf("WKB linestring data too short")
 	}
 	numPoints := int(bo.Uint32(data[0:4]))
-	ords := readOrdinates(data[4:], bo, numPoints, dims)
+	ords, err := readOrdinates(data[4:], bo, numPoints, dims)
+	if err != nil {
+		return nil, err
+	}
 
 	return &SdoGeometry{
 		GType:     int64(dims)*1000 + 2,
@@ -130,7 +133,10 @@ func parseWKBPolygon(data []byte, bo binary.ByteOrder, dims int, srid int64) (*S
 		}
 		elemInfo = append(elemInfo, int64(len(ordinates)+1), etype, 1)
 
-		ords := readOrdinates(data[offset:], bo, numPoints, dims)
+		ords, err := readOrdinates(data[offset:], bo, numPoints, dims)
+		if err != nil {
+			return nil, err
+		}
 		ordinates = append(ordinates, ords...)
 		offset += numPoints * dims * 8
 	}
@@ -179,7 +185,10 @@ func parseWKBMulti(data []byte, bo binary.ByteOrder, dims int, srid int64, sdoGT
 				return nil, fmt.Errorf("WKB multi point data truncated")
 			}
 			elemInfo = append(elemInfo, int64(len(ordinates)+1), 1, 1)
-			ords := readOrdinates(data[offset:], subBO, 1, dims)
+			ords, err := readOrdinates(data[offset:], subBO, 1, dims)
+			if err != nil {
+				return nil, err
+			}
 			ordinates = append(ordinates, ords...)
 			offset += dims * 8
 
@@ -190,7 +199,10 @@ func parseWKBMulti(data []byte, bo binary.ByteOrder, dims int, srid int64, sdoGT
 			numPoints := int(subBO.Uint32(data[offset : offset+4]))
 			offset += 4
 			elemInfo = append(elemInfo, int64(len(ordinates)+1), 2, 1)
-			ords := readOrdinates(data[offset:], subBO, numPoints, dims)
+			ords, err := readOrdinates(data[offset:], subBO, numPoints, dims)
+			if err != nil {
+				return nil, err
+			}
 			ordinates = append(ordinates, ords...)
 			offset += numPoints * dims * 8
 
@@ -212,7 +224,10 @@ func parseWKBMulti(data []byte, bo binary.ByteOrder, dims int, srid int64, sdoGT
 					etype = 2003
 				}
 				elemInfo = append(elemInfo, int64(len(ordinates)+1), etype, 1)
-				ords := readOrdinates(data[offset:], subBO, numPoints, dims)
+				ords, err := readOrdinates(data[offset:], subBO, numPoints, dims)
+				if err != nil {
+					return nil, err
+				}
 				ordinates = append(ordinates, ords...)
 				offset += numPoints * dims * 8
 			}
@@ -230,10 +245,16 @@ func parseWKBMulti(data []byte, bo binary.ByteOrder, dims int, srid int64, sdoGT
 	}, nil
 }
 
-func readOrdinates(data []byte, bo binary.ByteOrder, numPoints, dims int) []float64 {
+func readOrdinates(data []byte, bo binary.ByteOrder, numPoints, dims int) ([]float64, error) {
+	// numPoints comes off the wire; validate against the remaining bytes
+	// before allocating or indexing (a corrupt count would otherwise panic
+	// or allocate gigabytes).
+	if numPoints < 0 || dims <= 0 || numPoints > len(data)/(dims*8) {
+		return nil, fmt.Errorf("WKB ordinate data truncated: %d points × %d dims, %d bytes available", numPoints, dims, len(data))
+	}
 	ords := make([]float64, numPoints*dims)
 	for i := range ords {
 		ords[i] = readFloat64(data, i*8, bo)
 	}
-	return ords
+	return ords, nil
 }
