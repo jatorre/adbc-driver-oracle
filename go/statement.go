@@ -61,6 +61,12 @@ type statementImpl struct {
 	ingestClobColumns   map[string]bool // uppercased column names forced to CLOB
 	ingestScanLimitByte int64           // max bytes buffered for the auto type scan (0 = scan disabled)
 	ingestScanLimitSet  bool            // distinguishes "unset, use default" from an explicit 0
+
+	// inlineLimit is the VARCHAR2/CLOB byte boundary for this ingest, resolved
+	// from the server's MAX_STRING_SIZE (4000 STANDARD / 32767 EXTENDED) once
+	// executeBulkIngest starts. Threaded into resolveColumnTypes (DDL) and
+	// stringColumnToSlice (bind type) so both agree per column.
+	inlineLimit int
 }
 
 func (s *statementImpl) Base() *driverbase.StatementImplBase {
@@ -340,6 +346,12 @@ func extractArrowValue(arr arrow.Array, idx int) interface{} {
 func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 	tableName := strings.ToUpper(s.ingestTargetTable)
 
+	// Resolve the VARCHAR2/CLOB boundary from the server's MAX_STRING_SIZE once,
+	// up front: both the DDL (resolveColumnTypes) and the per-batch bind type
+	// (stringColumnToSlice) must use the same limit or a VARCHAR2 column could
+	// receive a CLOB bind (or vice versa).
+	s.inlineLimit = s.cnxn.inlineStringLimit(ctx)
+
 	// Determine the schema from bindStream or bindParams
 	var schema *arrow.Schema
 	if s.bindStream != nil {
@@ -404,7 +416,7 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 				}
 			}
 		}
-		colTypes = resolveColumnTypes(schema, widths, s.ingestStringType, s.ingestClobColumns)
+		colTypes = resolveColumnTypes(schema, widths, s.ingestStringType, s.ingestClobColumns, s.inlineLimit)
 		for i, f := range schema.Fields() {
 			if colTypes[i] == "CLOB" && s.cnxn.Logger != nil {
 				s.cnxn.Logger.Info("oracle ingest: string column mapped to CLOB",
@@ -467,7 +479,7 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 					// This also copies the data, so Arrow buffer reuse is safe.
 					args[col] = wkbColumnToSdoSliceRange(arr, 0, nrow, srid)
 				} else {
-					args[col] = arrowColumnToSliceRange(arr, 0, nrow)
+					args[col] = arrowColumnToSliceRange(arr, 0, nrow, s.inlineLimit)
 				}
 			}
 			return preparedBatch{args: args, nrow: nrow}
@@ -634,7 +646,7 @@ func (s *statementImpl) insertChunk(ctx context.Context, insertSQL string, rec a
 		if srid, ok := s.ingestGeomCols[col]; ok {
 			args[col] = wkbColumnToSdoSliceRange(arr, startRow, endRow, srid)
 		} else {
-			args[col] = arrowColumnToSliceRange(arr, startRow, endRow)
+			args[col] = arrowColumnToSliceRange(arr, startRow, endRow, s.inlineLimit)
 		}
 	}
 
@@ -697,7 +709,7 @@ func (s *statementImpl) insertPreparedBatch(ctx context.Context, insertSQL strin
 // underlying buffer, which is released when the next stream record arrives.
 // Holding the alias past that point produces use-after-free corruption
 // (manifests as garbled VARCHAR2 columns through Oracle's bulk array bind).
-func arrowColumnToSliceRange(arr arrow.Array, start, end int) interface{} {
+func arrowColumnToSliceRange(arr arrow.Array, start, end, inlineLimit int) interface{} {
 	numRows := end - start
 	switch a := arr.(type) {
 	case *array.Int64:
@@ -755,9 +767,9 @@ func arrowColumnToSliceRange(arr arrow.Array, start, end int) interface{} {
 		}
 		return vals
 	case *array.String:
-		return stringColumnToSlice(a, start, end)
+		return stringColumnToSlice(a, start, end, inlineLimit)
 	case *array.LargeString:
-		return stringColumnToSlice(a, start, end)
+		return stringColumnToSlice(a, start, end, inlineLimit)
 	case *array.Binary:
 		return binaryColumnToSlice(a, start, end)
 	case *array.LargeBinary:
@@ -803,7 +815,7 @@ func arrowColumnToSliceRange(arr arrow.Array, start, end int) interface{} {
 		}
 		return vals
 	case *array.StringView:
-		return stringColumnToSlice(a, start, end)
+		return stringColumnToSlice(a, start, end, inlineLimit)
 	default:
 		// Remaining types (Time32/64, Duration, Interval, Dictionary, nested…)
 		// have no natural Oracle mapping; bind their textual form into the
@@ -846,7 +858,7 @@ func intColumnToSlice[T int64 | int32 | int16 | int8 | uint32 | uint16 | uint8](
 func stringColumnToSlice(a interface {
 	arrow.Array
 	Value(int) string
-}, start, end int) interface{} {
+}, start, end, inlineLimit int) interface{} {
 	vals := make([]sql.NullString, end-start)
 	maxWidth := 0
 	for i := start; i < end; i++ {
@@ -858,7 +870,7 @@ func stringColumnToSlice(a interface {
 			vals[i-start] = sql.NullString{String: v, Valid: true}
 		}
 	}
-	if maxWidth <= maxInlineStringBytes {
+	if maxWidth <= inlineLimit {
 		return vals
 	}
 	lobs := make([]go_ora.Clob, len(vals))
@@ -1056,9 +1068,14 @@ func extractSRIDFromField(f arrow.Field) int64 {
 	return 4326
 }
 
-// maxInlineStringBytes is the VARCHAR2 byte cap (with MAX_STRING_SIZE=STANDARD).
-// String values wider than this must be stored as CLOB.
+// maxInlineStringBytes is the VARCHAR2 byte cap with MAX_STRING_SIZE=STANDARD.
+// String values wider than this must be stored as CLOB on a STANDARD server.
 const maxInlineStringBytes = 4000
+
+// maxExtendedStringBytes is the VARCHAR2 byte cap with MAX_STRING_SIZE=EXTENDED
+// (the Autonomous DB default). Values up to this size bind as plain VARCHAR2
+// (fast batch array bind) instead of per-row temporary-LOB CLOB binds.
+const maxExtendedStringBytes = 32767
 
 // defaultTypeScanLimitBytes bounds how much of a bound stream executeBulkIngest
 // buffers while sizing string columns in "auto" mode (~64 MiB keeps a couple of
@@ -1162,7 +1179,11 @@ func arrayDataSize(data arrow.ArrayData) int64 {
 //     strings stay VARCHAR2.
 //
 // widths may be nil when no scan ran (forced types, or scan disabled).
-func resolveColumnTypes(schema *arrow.Schema, widths []int, stringType string, clobColumns map[string]bool) []string {
+// inlineLimit is the VARCHAR2 byte cap for this server (maxInlineStringBytes on
+// STANDARD, maxExtendedStringBytes on EXTENDED); columns wider than it become
+// CLOB. It must match the value threaded into stringColumnToSlice so the DDL
+// type and the per-batch bind type agree.
+func resolveColumnTypes(schema *arrow.Schema, widths []int, stringType string, clobColumns map[string]bool, inlineLimit int) []string {
 	types := make([]string, schema.NumFields())
 	for i, f := range schema.Fields() {
 		if isGeometryColumn(f) {
@@ -1175,13 +1196,13 @@ func resolveColumnTypes(schema *arrow.Schema, widths []int, stringType string, c
 			case clobColumns[strings.ToUpper(f.Name)] || stringType == "clob":
 				types[i] = "CLOB"
 			case stringType == "varchar2":
-				types[i] = fmt.Sprintf("VARCHAR2(%d)", maxInlineStringBytes)
-			case widths != nil && i < len(widths) && widths[i] > maxInlineStringBytes:
+				types[i] = fmt.Sprintf("VARCHAR2(%d)", inlineLimit)
+			case widths != nil && i < len(widths) && widths[i] > inlineLimit:
 				types[i] = "CLOB"
 			case widths == nil && id == arrow.LARGE_STRING:
 				types[i] = "CLOB"
 			default:
-				types[i] = fmt.Sprintf("VARCHAR2(%d)", maxInlineStringBytes)
+				types[i] = fmt.Sprintf("VARCHAR2(%d)", inlineLimit)
 			}
 			continue
 		}
@@ -1194,7 +1215,7 @@ func resolveColumnTypes(schema *arrow.Schema, widths []int, stringType string, c
 // resolveColumnTypes; pass nil to use data-independent defaults.
 func buildCreateTableDDL(tableName string, schema *arrow.Schema, colTypes []string) string {
 	if colTypes == nil {
-		colTypes = resolveColumnTypes(schema, nil, "", nil)
+		colTypes = resolveColumnTypes(schema, nil, "", nil, maxInlineStringBytes)
 	}
 	var cols []string
 	for i, f := range schema.Fields() {

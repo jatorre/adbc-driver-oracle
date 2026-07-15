@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"strings"
+	"sync"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
@@ -29,6 +30,36 @@ type connectionImpl struct {
 	db            *sql.DB
 	ownsDB        bool // if true, Close() closes the db; if false, pool is shared
 	ingestWorkers int  // parallel insert workers (from database config)
+
+	varcharOnce  sync.Once
+	varcharLimit int // cached inline VARCHAR2 byte cap; see inlineStringLimit
+}
+
+// inlineStringLimit is the max byte length a value can carry as a plain
+// VARCHAR2 bind (vs. a temporary-LOB CLOB bind). Oracle allows 32767-byte
+// VARCHAR2 when MAX_STRING_SIZE=EXTENDED (the Autonomous DB default), else 4000.
+//
+// This matters for ingest throughput, not storage: on EXTENDED Oracle already
+// stores VARCHAR2 >4000 out-of-line, but a VARCHAR2 column binds the whole batch
+// as one plain-string array (a single array execute), whereas a CLOB column
+// allocates a temporary LOB locator per row (per-value round-trips). Sizing
+// wide-but-<=32767 columns as VARCHAR2 keeps the fast batch path; only values
+// beyond 32767 bytes need CLOB.
+//
+// Detected once and cached. Any probe failure (e.g. no v$parameter privilege)
+// falls back to the safe 4000 — correct everywhere, just slower for wide text.
+func (c *connectionImpl) inlineStringLimit(ctx context.Context) int {
+	c.varcharOnce.Do(func() {
+		c.varcharLimit = maxInlineStringBytes
+		var v string
+		if err := c.db.QueryRowContext(ctx,
+			"SELECT value FROM v$parameter WHERE name = 'max_string_size'").Scan(&v); err == nil {
+			if strings.EqualFold(strings.TrimSpace(v), "EXTENDED") {
+				c.varcharLimit = maxExtendedStringBytes
+			}
+		}
+	})
+	return c.varcharLimit
 }
 
 func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
