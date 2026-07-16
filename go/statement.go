@@ -26,6 +26,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/adbc-drivers/driverbase-go/driverbase"
@@ -464,12 +466,7 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 	if s.bindStream != nil {
 		// Pipeline: prepare next batch while current one is inserting.
 		// This overlaps CPU-bound column conversion with network-bound Oracle insert.
-		type preparedBatch struct {
-			args []interface{}
-			nrow int
-		}
-
-		convert := func(rec arrow.RecordBatch) preparedBatch {
+		convert := func(rec arrow.RecordBatch) preparedBatchT {
 			nrow := int(rec.NumRows())
 			args := make([]interface{}, int(rec.NumCols()))
 			for col := 0; col < int(rec.NumCols()); col++ {
@@ -482,18 +479,21 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 					args[col] = arrowColumnToSliceRange(arr, 0, nrow, s.inlineLimit)
 				}
 			}
-			return preparedBatch{args: args, nrow: nrow}
+			return preparedBatchT{args: args, nrow: nrow}
 		}
 
-		ahead := make(chan preparedBatch, 1)
+		workers := s.streamWorkerCount()
+		ahead := make(chan preparedBatchT, workers*2)
 		done := make(chan struct{})
+		var doneOnce sync.Once
+		closeDone := func() { doneOnce.Do(func() { close(done) }) }
 		prodExited := make(chan struct{})
-		// Join the producer before returning (defers run LIFO: close(done)
+		// Join the producer before returning (defers run LIFO: closeDone
 		// unblocks it first). Otherwise an early error return would leave the
 		// goroutine using bindStream while the caller Closes or re-executes
 		// the statement.
 		defer func() { <-prodExited }()
-		defer close(done)
+		defer closeDone()
 		bufferedOwned = false // producer goroutine releases buffered records
 		go func() {
 			defer close(prodExited)
@@ -530,12 +530,40 @@ func (s *statementImpl) executeBulkIngest(ctx context.Context) (int64, error) {
 			}
 		}()
 
-		for batch := range ahead {
-			n, err := s.insertPreparedBatch(ctx, insertSQL, batch.args, batch.nrow)
-			if err != nil {
-				return totalRows, err
-			}
-			totalRows += n
+		// Consumers: fan the stream across `workers` connections. Inserts are
+		// order-independent; the round-trip latency (prepare/exec/commit) of one
+		// worker overlaps another's, which is where the wall-clock win comes
+		// from on WAN links. Errors close `done` (stops the producer) and the
+		// remaining workers drain ahead via the closed channel.
+		var (
+			wg       sync.WaitGroup
+			rowsIns  int64
+			firstErr error
+			errOnce  sync.Once
+		)
+		stopOnErr := func(err error) {
+			errOnce.Do(func() {
+				firstErr = err
+				// Producer watches `done`; closing it here (not just via the
+				// defer) stops conversion as soon as any worker fails.
+				closeDone()
+			})
+		}
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				n, err := s.streamInsertWorker(ctx, insertSQL, ahead, done)
+				atomic.AddInt64(&rowsIns, n)
+				if err != nil {
+					stopOnErr(err)
+				}
+			}()
+		}
+		wg.Wait()
+		totalRows = atomic.LoadInt64(&rowsIns)
+		if firstErr != nil {
+			return totalRows, firstErr
 		}
 		if err := s.bindStream.Err(); err != nil {
 			return totalRows, s.ErrorHelper.Errorf(adbc.StatusIO, "bind stream error: %s", err)
@@ -664,6 +692,141 @@ func (s *statementImpl) insertChunk(ctx context.Context, insertSQL string, rec a
 
 // insertPreparedBatch inserts pre-converted column args into Oracle.
 // Used by the pipeline path where column conversion happens in a background goroutine.
+// preparedBatchT is one converted record batch queued for insert: columnar
+// go-ora bind args plus the row count they carry.
+type preparedBatchT struct {
+	args []interface{}
+	nrow int
+}
+
+// streamWorkerCount resolves the stream-consumer parallelism: the
+// oracle.ingest_workers option / ORACLE_INGEST_WORKERS env when set, else 4.
+// Stream inserts are round-trip-bound (prepare/exec/commit to a remote
+// listener), so overlapping a few connections is a wall-clock win even on
+// small instances; 4 keeps contention modest on 1-ECPU Autonomous tiers.
+func (s *statementImpl) streamWorkerCount() int {
+	n := s.cnxn.ingestWorkers
+	if w := os.Getenv("ORACLE_INGEST_WORKERS"); w != "" {
+		fmt.Sscanf(w, "%d", &n)
+	}
+	if n <= 0 {
+		n = 4
+	}
+	return n
+}
+
+// Stream-consumer tuning. Commits are batched (an Oracle round trip each) and
+// sessions are recycled periodically: go-ora sessions that bind many
+// SDO_GEOMETRY UDTs eventually hit ORA-00600 [kopi2_readlen083] (see
+// insertChunk), so a worker re-connects every streamRecycleBatches batches
+// instead of holding one session for the whole stream.
+const (
+	streamCommitEveryBatches = 16
+	streamRecycleBatches     = 64
+)
+
+// streamInsertWorker drains prepared batches from `in` over its own pooled
+// connection: prepare once per session, exec per batch, COMMIT every
+// streamCommitEveryBatches, recycle the session every streamRecycleBatches.
+// Returns the rows successfully inserted AND committed.
+func (s *statementImpl) streamInsertWorker(ctx context.Context, insertSQL string, in <-chan preparedBatchT, done <-chan struct{}) (int64, error) {
+	var (
+		conn         *sql.Conn
+		stmt         *sql.Stmt
+		committed    int64
+		uncommitted  int64
+		sinceCommit  int
+		sinceRecycle int
+	)
+	cleanup := func() {
+		if stmt != nil {
+			stmt.Close()
+			stmt = nil
+		}
+		if conn != nil {
+			conn.Close()
+			conn = nil
+		}
+	}
+	defer cleanup()
+
+	open := func() error {
+		var err error
+		if conn, err = s.cnxn.db.Conn(ctx); err != nil {
+			return s.ErrorHelper.Errorf(adbc.StatusIO, "get connection failed: %s", err)
+		}
+		if stmt, err = conn.PrepareContext(ctx, insertSQL); err != nil {
+			cleanup()
+			return s.ErrorHelper.Errorf(adbc.StatusIO, "prepare insert failed: %s", err)
+		}
+		sinceRecycle = 0
+		return nil
+	}
+	commit := func() error {
+		if conn == nil || uncommitted == 0 {
+			return nil
+		}
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			return s.ErrorHelper.Errorf(adbc.StatusIO, "commit failed: %s", err)
+		}
+		committed += uncommitted
+		uncommitted = 0
+		sinceCommit = 0
+		return nil
+	}
+
+	for {
+		var (
+			pb preparedBatchT
+			ok bool
+		)
+		select {
+		case pb, ok = <-in:
+		case <-done:
+			// Another worker failed; commit what this worker already wrote
+			// (matches the previous per-batch-commit semantics) and stop.
+			err := commit()
+			return committed, err
+		}
+		if !ok {
+			err := commit()
+			return committed, err
+		}
+		if conn == nil {
+			if err := open(); err != nil {
+				return committed, err
+			}
+		}
+		if _, err := stmt.ExecContext(ctx, pb.args...); err != nil {
+			commitErr := commit() // keep completed batches, like the old path
+			_ = commitErr
+			if isOraCode(err, 12899) {
+				// A string wider than the scan window predicted slipped past
+				// the auto sizing; tell the caller how to force CLOB.
+				return committed, s.ErrorHelper.Errorf(adbc.StatusIO,
+					"batch insert failed: %s (hint: value exceeds the column width chosen by the "+
+						"auto type scan — set %s for the affected column, or %s=clob)",
+					err, OptionIngestClobColumns, OptionIngestStringType)
+			}
+			return committed, s.ErrorHelper.Errorf(adbc.StatusIO, "batch insert failed: %s", err)
+		}
+		uncommitted += int64(pb.nrow)
+		sinceCommit++
+		sinceRecycle++
+		if sinceCommit >= streamCommitEveryBatches {
+			if err := commit(); err != nil {
+				return committed, err
+			}
+		}
+		if sinceRecycle >= streamRecycleBatches {
+			if err := commit(); err != nil {
+				return committed, err
+			}
+			cleanup()
+		}
+	}
+}
+
 func (s *statementImpl) insertPreparedBatch(ctx context.Context, insertSQL string, args []interface{}, numRows int) (int64, error) {
 	conn, err := s.cnxn.db.Conn(ctx)
 	if err != nil {
