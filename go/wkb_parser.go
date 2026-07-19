@@ -137,7 +137,7 @@ func parseWKBPolygon(data []byte, bo binary.ByteOrder, dims int, srid int64) (*S
 		if err != nil {
 			return nil, err
 		}
-		ordinates = append(ordinates, ords...)
+		ordinates = append(ordinates, orientRing(ords, dims, ring == 0)...)
 		offset += numPoints * dims * 8
 	}
 
@@ -228,7 +228,7 @@ func parseWKBMulti(data []byte, bo binary.ByteOrder, dims int, srid int64, sdoGT
 				if err != nil {
 					return nil, err
 				}
-				ordinates = append(ordinates, ords...)
+				ordinates = append(ordinates, orientRing(ords, dims, ring == 0)...)
 				offset += numPoints * dims * 8
 			}
 
@@ -243,6 +243,33 @@ func parseWKBMulti(data []byte, bo binary.ByteOrder, dims int, srid int64, sdoGT
 		ElemInfo:  elemInfo,
 		Ordinates: ordinates,
 	}, nil
+}
+
+// orientRing enforces Oracle's SDO ring convention — exterior rings
+// counter-clockwise, interior rings (holes) clockwise — reversing the point
+// order in place when the winding disagrees (ORA-13367 otherwise). WKB
+// carries no winding guarantee, so this must be normalized on conversion.
+func orientRing(ords []float64, dims int, exterior bool) []float64 {
+	n := len(ords) / dims
+	if n < 3 {
+		return ords
+	}
+	// Shoelace signed area over (x, y); positive = counter-clockwise.
+	var area float64
+	for i := 0; i < n-1; i++ {
+		x1, y1 := ords[i*dims], ords[i*dims+1]
+		x2, y2 := ords[(i+1)*dims], ords[(i+1)*dims+1]
+		area += x1*y2 - x2*y1
+	}
+	if (area > 0) == exterior || area == 0 {
+		return ords
+	}
+	for i, j := 0, n-1; i < j; i, j = i+1, j-1 {
+		for d := 0; d < dims; d++ {
+			ords[i*dims+d], ords[j*dims+d] = ords[j*dims+d], ords[i*dims+d]
+		}
+	}
+	return ords
 }
 
 func readOrdinates(data []byte, bo binary.ByteOrder, numPoints, dims int) ([]float64, error) {
