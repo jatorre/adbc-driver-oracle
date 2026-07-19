@@ -177,8 +177,12 @@ func TestIntegration_IngestWideStrings(t *testing.T) {
 	for _, row := range res.rows {
 		types[row[0]] = row[1]
 	}
-	if types["DATA"] != "CLOB" {
-		t.Errorf("DATA type = %q, want CLOB", types["DATA"])
+	// Wide strings land as CLOB on MAX_STRING_SIZE=STANDARD servers; on
+	// EXTENDED servers values ≤ 32767 bytes stay inline as VARCHAR2 for
+	// ingest speed (server-aware sizing, sc-562356). Both satisfy the
+	// original acceptance: > 4000-byte strings ingest without ORA-12899.
+	if types["DATA"] != "CLOB" && types["DATA"] != "VARCHAR2" {
+		t.Errorf("DATA type = %q, want CLOB or VARCHAR2", types["DATA"])
 	}
 	if types["NAME"] != "VARCHAR2" {
 		t.Errorf("NAME type = %q, want VARCHAR2", types["NAME"])

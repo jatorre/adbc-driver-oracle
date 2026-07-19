@@ -20,7 +20,7 @@ require (
 //   - NULL UDT result-set decode: removes the bogus extra 0x81 0x01
 //     trailer read so SELECTs that include NULL SDO_GEOMETRY rows don't
 //     desync the stream and crash later rows with "invalid size for GetInt64".
-replace github.com/sijms/go-ora/v2 => github.com/jatorre/go-ora/v2 v2.8.25-0.20260425184954-cc44340b0974
+replace github.com/sijms/go-ora/v2 => github.com/jatorre/go-ora/v2 v2.9.1-0.20260719131444-0a202851613c
 
 require (
 	github.com/adbc-drivers/driverbase-go/testutil v0.0.0-20251215145213-df04bfe8de4f // indirect
