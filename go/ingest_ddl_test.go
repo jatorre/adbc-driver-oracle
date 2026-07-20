@@ -76,14 +76,17 @@ func TestResolveColumnTypes(t *testing.T) {
 		// With scan data available, LargeString is sized like String.
 		widths := []int{0, 120, 28198, 5000}
 		got := resolveColumnTypes(schema, widths, "", nil, maxInlineStringBytes)
-		want := []string{"NUMBER(19)", "VARCHAR2(4000)", "CLOB", "CLOB"}
+		// VARCHAR2 is sized to the observed width (+headroom, 64-byte bucket),
+		// not the inline limit — go-ora's read buffer scales with declared width.
+		want := []string{"NUMBER(19)", "VARCHAR2(256)", "CLOB", "CLOB"}
 		assertStrings(t, got, want)
 	})
 
 	t.Run("auto boundary at 4000 bytes", func(t *testing.T) {
 		widths := []int{0, 4000, 4001, 10}
 		got := resolveColumnTypes(schema, widths, "", nil, maxInlineStringBytes)
-		want := []string{"NUMBER(19)", "VARCHAR2(4000)", "CLOB", "VARCHAR2(4000)"}
+		// width 4000 fits inline (kept at 4000); 4001 > limit → CLOB; 10 → tight VARCHAR2(64)
+		want := []string{"NUMBER(19)", "VARCHAR2(4000)", "CLOB", "VARCHAR2(64)"}
 		assertStrings(t, got, want)
 	})
 
@@ -108,7 +111,7 @@ func TestResolveColumnTypes(t *testing.T) {
 	t.Run("clob_columns overrides scan", func(t *testing.T) {
 		widths := []int{0, 10, 10, 10}
 		got := resolveColumnTypes(schema, widths, "", map[string]bool{"NARROW": true}, maxInlineStringBytes)
-		want := []string{"NUMBER(19)", "CLOB", "VARCHAR2(4000)", "VARCHAR2(4000)"}
+		want := []string{"NUMBER(19)", "CLOB", "VARCHAR2(64)", "VARCHAR2(64)"}
 		assertStrings(t, got, want)
 	})
 }
