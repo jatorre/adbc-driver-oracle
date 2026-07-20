@@ -1346,6 +1346,32 @@ func arrayDataSize(data arrow.ArrayData) int64 {
 // STANDARD, maxExtendedStringBytes on EXTENDED); columns wider than it become
 // CLOB. It must match the value threaded into stringColumnToSlice so the DDL
 // type and the per-batch bind type agree.
+// varcharDeclWidth picks a VARCHAR2 declared width from the observed max byte
+// width of a column's data. It adds headroom (values beyond the type-scan
+// window aren't measured — same trust the CLOB threshold already relies on)
+// and rounds up to a 64-byte bucket for stability across similar batches,
+// clamped to [64, inlineLimit]. Kept tight because go-ora's read buffer scales
+// with the declared width, not the actual value length.
+func varcharDeclWidth(observed, inlineLimit int) int {
+	if observed < 1 {
+		observed = 1
+	}
+	n := ((observed*2 + 16 + 63) / 64) * 64 // 2x headroom, rounded to a 64-byte bucket
+	// A column whose data fits inline (<= 4000 bytes) must stay declared inline
+	// even after headroom — VARCHAR2 > 4000 stores out-of-line on EXTENDED
+	// servers and reads slowly, the very thing this sizing avoids.
+	if observed <= maxInlineStringBytes && n > maxInlineStringBytes {
+		n = maxInlineStringBytes
+	}
+	if n < 64 {
+		n = 64
+	}
+	if n > inlineLimit {
+		n = inlineLimit
+	}
+	return n
+}
+
 func resolveColumnTypes(schema *arrow.Schema, widths []int, stringType string, clobColumns map[string]bool, inlineLimit int) []string {
 	types := make([]string, schema.NumFields())
 	for i, f := range schema.Fields() {
@@ -1362,7 +1388,16 @@ func resolveColumnTypes(schema *arrow.Schema, widths []int, stringType string, c
 				types[i] = fmt.Sprintf("VARCHAR2(%d)", inlineLimit)
 			case widths != nil && i < len(widths) && widths[i] > inlineLimit:
 				types[i] = "CLOB"
-			case widths == nil && id == arrow.LARGE_STRING:
+			case widths != nil && i < len(widths):
+				// Size to the observed max width, not the server inline limit.
+				// go-ora array-fetch defines a per-row buffer sized to the
+				// DECLARED VARCHAR2 width, so declaring VARCHAR2(32767) for a
+				// column of short strings makes reads O(declared width)/row —
+				// a full-table read of such a column is 30x+ slower and can
+				// exceed query timeouts (Oracle-as-source transfers, exports).
+				// Reads scale linearly with the declared width, so keep it tight.
+				types[i] = fmt.Sprintf("VARCHAR2(%d)", varcharDeclWidth(widths[i], inlineLimit))
+			case id == arrow.LARGE_STRING:
 				types[i] = "CLOB"
 			default:
 				types[i] = fmt.Sprintf("VARCHAR2(%d)", inlineLimit)
