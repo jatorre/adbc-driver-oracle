@@ -28,6 +28,7 @@ import (
 	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/apache/arrow-adbc/go/adbc"
 	go_ora "github.com/sijms/go-ora/v2"
+	"github.com/sijms/go-ora/v2/configurations"
 )
 
 type databaseImpl struct {
@@ -40,7 +41,7 @@ type databaseImpl struct {
 	password       string
 	walletLocation string
 	walletPassword string
-	walletContent  string // Inline ewallet.pem content (avoids temp dir)
+	walletContent  string // base64 cwallet.sso, or PEM client certificate + unencrypted key
 	dsn            string
 
 	// Performance tuning
@@ -130,7 +131,11 @@ func (db *databaseImpl) buildDSN() string {
 		return db.dsn
 	}
 
-	return assembleOracleURL(db.user, db.password, db.hostname, db.port, db.serviceName, db.walletLocation, db.walletPassword)
+	dsn := assembleOracleURL(db.user, db.password, db.hostname, db.port, db.serviceName, db.walletLocation, db.walletPassword)
+	if db.walletLocation == "" && isPEMWallet(db.walletContent) {
+		dsn += "&" + url.Values{"SSL": {"enable"}, "SSL VERIFY": {"false"}}.Encode()
+	}
+	return dsn
 }
 
 // assembleOracleURL builds the oracle://user:pass@host:port/service URL with
@@ -168,7 +173,22 @@ func (db *databaseImpl) getPool(ctx context.Context) (*sql.DB, error) {
 		var pool *sql.DB
 		var err error
 
-		if db.walletContent != "" {
+		if isPEMWallet(db.walletContent) {
+			dsn := db.buildDSN()
+			cfg, cfgErr := configurations.ParseConfig(dsn)
+			if cfgErr != nil {
+				db.poolErr = fmt.Errorf("failed to parse Oracle DSN: %w", cfgErr)
+				return
+			}
+			tlsConfig, tlsErr := tlsConfigFromPEM(db.walletContent, cfg.SSLVerify)
+			if tlsErr != nil {
+				db.poolErr = tlsErr
+				return
+			}
+			connector := go_ora.NewConnector(dsn).(*go_ora.OracleConnector)
+			connector.WithTLSConfig(tlsConfig)
+			pool = sql.OpenDB(connector)
+		} else if db.walletContent != "" {
 			// Use Connector API for in-memory wallet (avoids temp files).
 			// Wallet content is base64-encoded cwallet.sso binary data.
 			walletBytes, decErr := base64.StdEncoding.DecodeString(db.walletContent)
