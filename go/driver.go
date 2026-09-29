@@ -31,7 +31,7 @@ const (
 	OptionPassword       = "oracle.password"
 	OptionWalletLocation = "oracle.wallet_location"
 	OptionWalletPassword = "oracle.wallet_password"
-	OptionWalletContent  = "oracle.wallet_content" // Inline ewallet.pem content (avoids temp file)
+	OptionWalletContent  = "oracle.wallet_content" // base64 cwallet.sso, or PEM client certificate + unencrypted private key (e.g. a decrypted ewallet.pem)
 	OptionDSN            = "oracle.dsn"
 	OptionPoolSize       = "oracle.pool_size"      // Max open connections (default: 8)
 	OptionIngestWorkers  = "oracle.ingest_workers" // Parallel insert workers (default: 1)
